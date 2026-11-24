@@ -834,6 +834,8 @@ impl State {
                     }
                 } else {
                     once!("a shader reads the runtime stride table without a host view heap");
+                    // Its root SRV would be unset (#193's f99b792): not run.
+                    return false;
                 }
             }
         }

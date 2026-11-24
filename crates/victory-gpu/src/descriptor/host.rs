@@ -1196,6 +1196,13 @@ fn buffer_srv(
         once!(first, "raw buffer view not on 16 bytes of its host copy");
         return None;
     }
+    // The host refuses a view of no elements, and the device goes with it
+    // (seen in the title once unknown-stride programs ran, #704): no view,
+    // so the slot is null and reads zeros. #193 guards the same case.
+    if buffer.NumElements == 0 {
+        once!("buffer view of no elements made null");
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1267,6 +1274,11 @@ fn buffer_uav(
             first,
             "raw unordered buffer view not on 16 bytes of its host copy"
         );
+        return None;
+    }
+    // As in `buffer_srv`: `CreateUnorderedAccessView` refuses no elements.
+    if buffer.NumElements == 0 {
+        once!("unordered buffer view of no elements made null");
         return None;
     }
     let host = host()?;

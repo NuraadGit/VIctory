@@ -8341,6 +8341,11 @@ impl<'a> Lower<'a> {
             let (h, coords) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
+                    // A stride the container names that is no multiple of four has
+                    // no dword-aligned raw form either (#193's f99b792).
+                    if stride != 0 && (stride < 4 || !stride.is_multiple_of(4)) {
+                        return Err("a structured buffer of unknown stride");
+                    }
                     if stride >= 4 && stride.is_multiple_of(4) {
                         (
                             self.handle(site, src, false, (12 | u, stride))?,
@@ -8428,6 +8433,11 @@ impl<'a> Lower<'a> {
                 match index {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
+                        // A stride the container names that is no multiple of four has
+                        // no dword-aligned raw form either (#193's f99b792).
+                        if stride != 0 && (stride < 4 || !stride.is_multiple_of(4)) {
+                            return Err("a structured buffer of unknown stride");
+                        }
                         if stride >= 4 && stride.is_multiple_of(4) {
                             args.push(self.handle(site, src, false, (12 | u, stride))?);
                             args.extend([index, off]);
@@ -8496,6 +8506,11 @@ impl<'a> Lower<'a> {
             match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
+                    // A stride the container names that is no multiple of four has
+                    // no dword-aligned raw form either (#193's f99b792).
+                    if stride != 0 && (stride < 4 || !stride.is_multiple_of(4)) {
+                        return Err("a structured buffer of unknown stride");
+                    }
                     if stride >= 4 && stride.is_multiple_of(4) {
                         let h = self.handle(site, src, false, (12 | u, stride))?;
                         self.s.op(
