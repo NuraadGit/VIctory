@@ -358,6 +358,28 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// How a heap index is bounded by the guard slot (`heap_guard`).
+#[derive(Clone, Copy, PartialEq)]
+enum GuardForm {
+    Select,
+    UMin,
+    Off,
+}
+
+/// `VICTORY_HEAP_GUARD_FORM`: `umin` or `off` in place of the default
+/// compare and select. Read when a program is translated, so a shader
+/// cache made with another value has to be cleared.
+fn guard_form() -> GuardForm {
+    static FORM: std::sync::OnceLock<GuardForm> = std::sync::OnceLock::new();
+    *FORM.get_or_init(
+        || match std::env::var("VICTORY_HEAP_GUARD_FORM").as_deref() {
+            Ok("umin") => GuardForm::UMin,
+            Ok("off") => GuardForm::Off,
+            _ => GuardForm::Select,
+        },
+    )
+}
+
 /// Samples whose level comes from derivatives across each quad of lanes,
 /// lowered with the quad's differences outside pixel shaders: the plain and
 /// biased forms, with or without a texel offset or level clamp (a
@@ -4742,8 +4764,22 @@ impl<'a> Lower<'a> {
             }
         };
         let c = self.cur;
-        let inside = self.s.m.cmp(c, pred::IULT, index, guard);
-        self.s.m.select(c, inside, index, guard)
+        match guard_form() {
+            // The same value as one operation (an index at or above the
+            // guard is the guard): a diagnostic for a fault in AMD's
+            // pipeline compiler on large modules with a compare and a
+            // select per handle.
+            GuardForm::UMin => {
+                self.s
+                    .op(c, "binary.i32", Attr::ReadNone, self.s.t.i32, 40, &[index, guard])
+            }
+            // No bound at all, as before the guard: the control.
+            GuardForm::Off => index,
+            GuardForm::Select => {
+                let inside = self.s.m.cmp(c, pred::IULT, index, guard);
+                self.s.m.select(c, inside, index, guard)
+            }
+        }
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
