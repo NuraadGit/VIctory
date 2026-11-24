@@ -200,6 +200,10 @@ struct Lower<'a> {
     virtual_waves: u32,
     /// Base dword index of the ballot / firstlane LDS scratch region.
     ballot_base: u32,
+    /// Wave32 emulation of a group of more than one host wave: the LDS dword
+    /// each host wave claims its console threads from (see
+    /// [`Lower::ensure_wave_ids`]).
+    claim_base: Option<u32>,
     /// Scratch dwords per virtual wave in `ballot_base` (`2` or `4`).
     ballot_stride: u32,
     /// Base dword index of the per-lane LDS exchange region (`64 * virtual_waves`).
@@ -868,6 +872,7 @@ impl<'a> Lower<'a> {
         let mut title_lds_dwords = 0u32;
         let mut virtual_waves = 0u32;
         let mut ballot_base = 0u32;
+        let mut claim_base = None;
         let mut ballot_stride = 0u32;
         let mut exchange_base = 0u32;
         let mut lds_overflow = false;
@@ -980,7 +985,8 @@ impl<'a> Lower<'a> {
                                 };
                                 ballot_base = title_lds_dwords;
                                 exchange_base = title_lds_dwords + ballot_dwords;
-                                let emu_dwords = ballot_dwords + exchange_dwords;
+                                claim_base = Some(exchange_base + exchange_dwords);
+                                let emu_dwords = ballot_dwords + exchange_dwords + 1;
                                 s.lds_dwords = title_lds_dwords.saturating_add(emu_dwords);
                                 lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
                                 cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
@@ -1106,6 +1112,7 @@ impl<'a> Lower<'a> {
             title_lds_dwords,
             virtual_waves,
             ballot_base,
+            claim_base,
             ballot_stride,
             exchange_base,
             lds_overflow,
@@ -1320,6 +1327,49 @@ impl<'a> Lower<'a> {
         );
         let flat = if self.wave64 == Wave64Mode::Emulate {
             flat_in
+        } else if let Some(claim) = self.claim_base {
+            // Host waves need not hold wave-aligned runs of flattened ids:
+            // NVIDIA packs a 3-D group's threads into waves in its own order,
+            // so the rounding below could give two host waves the same console
+            // lanes. Each host wave instead claims the next run of console
+            // threads: its first lane adds the wave's lane count to an LDS
+            // counter, and lane k takes the old value plus the lanes below it.
+            let i1 = self.s.t.i1;
+            let void = self.s.t.void;
+            let k0 = self.s.m.i32(0);
+            let zero = self.s.m.i32(0);
+            let p = self.scratch_ptr(e, claim, 0, zero, 0);
+            // Every thread writes the same 0; the barrier orders it before
+            // any claim (LDS starts undefined).
+            self.s.m.store(e, p, k0);
+            let sync = self.s.m.i32(1 | 8);
+            self.s
+                .op(e, "barrier", Attr::NoDuplicate, void, 80, &[sync]);
+            let yes = self.s.m.bool(true);
+            let count = self.s.op(e, "waveAllOp", Attr::NoUnwind, i32t, 135, &[yes]);
+            let first = self
+                .s
+                .op(e, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+            let add = self.s.m.select(e, first, count, k0);
+            let p = self.scratch_ptr(e, claim, 0, zero, 0);
+            let old = self.s.m.atomic(e, super::bitcode::Rmw::Add, p, add);
+            let base = self.s.op(
+                e,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[old],
+            );
+            let below = self
+                .s
+                .op(e, "wavePrefixOp", Attr::NoUnwind, i32t, 136, &[yes]);
+            self.s.flags |= flags::WAVE_OPS;
+            // The claims complete before any exchange through LDS.
+            self.s
+                .op(e, "barrier", Attr::NoDuplicate, void, 80, &[sync]);
+            let _ = flat_in;
+            self.s.m.bin(e, Bin::Add, base, below)
         } else {
             let first = self.s.op(
                 e,

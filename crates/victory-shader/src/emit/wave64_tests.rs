@@ -995,6 +995,37 @@ mod gpu {
     }
 
     #[test]
+    fn gpu_8x8x4_threads_each_console_lane_once() {
+        // A 3-D group: NVIDIA does not pack its threads into 32-lane waves by
+        // flattened id, so console lanes must be claimed, not derived from the
+        // host wave's first flattened id. Each thread stores its console lane
+        // (v_mbcnt over all lanes) at its flattened id from v0..v2.
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(5, NEG_ONE, inline_u(0)));
+        code.extend_from_slice(&v_mbcnt_hi_u32_b32(5, NEG_ONE, vgpr(5)));
+        code.push(v_lshlrev_b32(3, inline_u(3), 1)); // y * 8
+        code.push(v_add_nc_u32(3, vgpr(0), 3)); // + x
+        code.push(v_lshlrev_b32(4, inline_u(6), 2)); // z * 64
+        code.push(v_add_nc_u32(3, vgpr(4), 3));
+        emit_uav_store(&mut code, 5, 3);
+        code.push(S_ENDPGM);
+
+        let mut prog = make_cs_program(&code, [8, 8, 4], 0, false);
+        if let StageIo::Cs(io) = &mut prog.io {
+            io.rsrc2 |= 2 << 11; // thread ids x, y and z in v0..v2
+        }
+        let expected: Vec<u32> = (0..256u32).map(|f| f % 64).collect();
+        run_on_hosts(
+            "console_lanes_8x8x4",
+            &prog,
+            [1, 1, 1],
+            256,
+            &expected,
+            true,
+        );
+    }
+
+    #[test]
     fn gpu_96_threads_partial_virtual_wave() {
         // 96 threads: vwave 0 = 64 threads, vwave 1 = 32 threads (Half 0 only, NO Half 1!).
         // Tests both 64-lane ballot + Shape::Active across partial wave.
