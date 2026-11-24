@@ -1401,8 +1401,8 @@ fn a_group_id_in_s16_keeps_the_spill_rule_off() {
         None,
     );
     assert!(refused.is_err(), "the rule must not apply with GroupId.x in s16");
-    // With the rule forced, the root constant shows where the console has
-    // the group id: what the guard avoids.
+    // With the rule forced, the root constant and the group id are apart:
+    // a spill argument is no longer the physical SGPR of its number.
     let shader = spilled_cs(
         &words,
         layout,
@@ -1429,5 +1429,5 @@ fn a_group_id_in_s16_keeps_the_spill_rule_off() {
         )
         .unwrap();
     // The console: [116 (root constant), 0 (group 0)].
-    assert_eq!(&out[0][..2], &[116, 116]);
+    assert_eq!(&out[0][..2], &[116, 0]);
 }
