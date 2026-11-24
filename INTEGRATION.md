@@ -20,6 +20,7 @@ turned down upstream.
   the wave64 stack up to #439's head `e4d899f`.
 - Update 4 adds #566 (with the rest of #307) and brings the wave64 stack
   to #439's head `055aef9`.
+- Update 5 adds #453 (pixel barycentrics), with one fix commit after it.
 
 ## Reports from the title
 
@@ -182,6 +183,10 @@ and the name is its author's GitHub login.
   lane masks before the first lane's descriptor is taken as each lane's
   own; each failed proof has its own reason. Its commit `b1c8306` (the
   proof) is by fuzeofficlal. Stacked on #307.
+- #453 (AntoninMichelq), head `87e9d41`: a pixel program's barycentrics
+  read as values come from `SV_Barycentrics`, and interpolation with
+  computed barycentrics is evaluated from the vertex values. See
+  "Changes made in this branch" for the fix that follows it.
 - #309 (AntoninMichelq): SGPRs reloaded from VGPR lanes are read as the
   spilled value
 - #306 (wbkepler): DXIL validator failures (signatures, PSV0,
@@ -283,6 +288,9 @@ machines with newer drivers did not show it.
   it, `cargo test` sometimes never finishes, with several GPU tests stuck
   together. On the integration machine, before #433, 4 of 12 runs of the
   shader tests hung; with it, 0 of 12 did.
+- At update 5, one run of `cargo test --workspace --no-fail-fast --
+  --test-threads=4` on the RTX 5070 with no other GPU work started from
+  here: 442 passed, 5 ignored.
 - **Still not stable at update 4.** `cargo test --workspace
   --no-fail-fast` passed at the #566 merge (430 passed, 5 ignored). With
   r4tedx/VIctory#5 on top, 14 runs of the shader tests on the RTX 5070,
@@ -445,11 +453,29 @@ is described in its merge or fix commit.
   tests run one at a time`): in parallel the test binary sometimes died
   of an access violation (7 of 24 runs); with a lock, as #433's, 0 of 36
   runs of those tests alone.
+- **#453's conflicts:** in `emit/lower.rs` the interpolation's packing
+  keeps #176's `half_inputs` lookup with #453's `total` closure after
+  it; in `io.rs`, #179's `Halves` made on demand with #453's
+  `push_pair`, and both sides' tests; #453's test helper takes #566's
+  argument of `resource::track` and #223's `Target`.
+- **A fix after #453** (commit `Shaders: at most one perspective and one
+  linear SV_Barycentrics, none of the console's`): #453 emitted modules
+  `dxil.dll` refuses in two cases. A program reading the barycentrics of
+  two sample positions of one kind (centre and centroid) now stops with
+  `barycentrics of two sample positions`, and an `SV_Barycentrics` row
+  in the console's own signature is no longer carried over. Two tests,
+  each failing without its half. In review, every probe #453 drew on the
+  RTX 5070 matched values computed on the CPU. On WARP, programs with
+  both a perspective and a linear `SV_Barycentrics` drew wrong values,
+  and so did DXC's own module for the same shader, so that is WARP's.
 
 ## Left out on purpose
 
 - #302: a spill-table load reads a register's current value, not its
   entry value (follow-up in #489)
+- #442 (AnoHunted): reads barycentrics as values, as #453's first commit
+  does; it refuses interpolation with computed barycentrics, which #453
+  lowers, so the tree takes #453
 - #193: its fallback reads a structured view through a raw handle,
   which returns 0 on NVIDIA; a title run with it (and other PRs) ended in
   a 0x887A0001 device removal
