@@ -69,6 +69,30 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    let lowered = lower_valu_cs(body).expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+/// Lowers [`build_valu_cs`]'s program.
+fn lower_valu_cs(body: &[u32]) -> Result<lower::Lowered, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -127,7 +151,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    lower::lower(&lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -138,26 +162,6 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
     })
-    .expect("lower");
-
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-    };
-
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
-        let ours = copy[4..20].to_vec();
-        v.validate(&mut copy).expect("DXIL validation failed");
-        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
-    }
-
-    shader
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
@@ -936,4 +940,67 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// The console compiler fills an M0-relative array of VGPRs from a run of
+/// SGPRs, and past the elements the program uses that run can hold a
+/// descriptor's address. Copies of it nothing but the array reads must not
+/// refuse the program; reading one as a number, or as the array's first
+/// element, still does.
+#[test]
+fn an_unused_array_element_may_hold_a_descriptor_address() {
+    const M0: u8 = 124;
+    // v[5..] = {s0, s1, s8}: two elements and the stored-to buffer's address.
+    let fill = [
+        vop1(0x001, 5, vgpr(1)), // v_mov_b32 v5, v1
+        vop1(0x001, 6, vgpr(2)), // v_mov_b32 v6, v2
+        vop1(0x001, 7, sgpr(8)), // v_mov_b32 v7, s8
+    ];
+    // The first 1 + (s3 & 1) elements become s2, one a loop turn.
+    let update = [
+        sop2(0x0E, 12, 3, 0x81),  // s_and_b32 s12, s3, 1
+        sop2(0x00, 12, 12, 0x81), // s_add_u32 s12, s12, 1
+        s_mov_b32(13, 0x80),      // s_mov_b32 s13, 0
+        s_mov_b32(M0, 13),        // loop: s_mov_b32 m0, s13
+        vop1(0x042, 5, vgpr(3)),  // v_movreld_b32 v5, v3
+        sop2(0x00, 13, 13, 0x81), // s_add_u32 s13, s13, 1
+        0xBF0A_0C0D,              // s_cmp_lt_u32 s13, s12
+        0xBF85_FFFB,              // s_cbranch_scc1 loop
+    ];
+    let read = [
+        sop2(0x0E, M0, 0, 0x81), // s_and_b32 m0, s0, 1
+        vop1(0x043, 0, vgpr(5)), // v_movrels_b32 v0, v5
+    ];
+    let xor_v7 = [0x3A00_0000 | 7 << 9 | 256]; // v_xor_b32 v0, v0, v7
+    let refusal = |words: &[&[u32]]| match lower_valu_cs(&words.concat()) {
+        Ok(_) => None,
+        Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+        Err(e) => panic!("{e}"),
+    };
+
+    let shader = build_valu_cs(&[&fill[..], &update, &read].concat());
+    let cases = [
+        [10, 21, 32, 0],
+        [11, 21, 32, 0],
+        [10, 21, 32, 1],
+        [11, 21, 32, 1],
+    ];
+    run_cases(&shader, &cases, |backend, i, [a, b, x, n], got| {
+        let elements = [x, if n & 1 == 1 { x } else { b }];
+        assert_eq!(got, elements[a as usize & 1], "{backend} case {i}");
+    });
+    assert_eq!(refusal(&[&fill, &read]), None, "without a join");
+
+    let why = Some("a descriptor's address or format read as data");
+    assert_eq!(refusal(&[&fill, &read, &xor_v7]), why);
+    assert_eq!(refusal(&[&fill, &update, &read, &xor_v7]), why);
+    let m0 = &read[..1];
+    // v_movrels_b32 v0, v7
+    assert_eq!(refusal(&[&fill, m0, &[vop1(0x043, 0, vgpr(7))]]), why);
+    // v_movreld_b32 v7, v3; v_movrels_b32 v0, v6
+    let base = [vop1(0x042, 7, vgpr(3)), vop1(0x043, 0, vgpr(6))];
+    assert_eq!(refusal(&[&fill, m0, &base]), why);
+    // v_mov_b32 v4, s8; v_movreld_b32 v5, v4: the address is an element's value.
+    let stored = [vop1(0x001, 4, sgpr(8)), vop1(0x042, 5, vgpr(4))];
+    assert_eq!(refusal(&[&fill, m0, &stored, &read]), why);
 }

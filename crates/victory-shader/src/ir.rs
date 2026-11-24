@@ -660,6 +660,15 @@ const DROPPED: &[&str] = &[
 ];
 
 /// Registers read, registers written.
+/// The registers `inst` reads, one per dword (empty if the IR drops it).
+pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
+    let lanes = 1 + u8::from(p.wave64);
+    effects(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs)
+        .ok()
+        .flatten()
+        .map_or_else(Vec::new, |e| e.0)
+}
+
 type Effects = (Vec<Reg>, Vec<Reg>);
 
 /// Registers an instruction reads and writes, one per dword, or `None` if
