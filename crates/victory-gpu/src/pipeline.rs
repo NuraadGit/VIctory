@@ -558,6 +558,13 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// [`host_pipeline`], waiting until the pipeline is made (see
+/// [`make::made`]); later [`host_pipeline`] calls then find it at once.
+#[cfg(all(test, windows))]
+pub(crate) fn test_host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    make::made(&pipeline(this).host)
+}
+
 #[cfg(all(test, windows))]
 pub(crate) fn test_compute_pipeline(
     host: victory_shader::emit::HostShader,
@@ -576,6 +583,10 @@ pub(crate) fn test_compute_pipeline(
     assert_eq!(
         hand_out(vec![shader], None, &PIPELINE_IIDS[0], &mut out),
         crate::object::S_OK
+    );
+    assert!(
+        test_host_pipeline(out).is_some(),
+        "the host refused the test's pipeline"
     );
     out
 }

@@ -167,7 +167,7 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     let null = std::ptr::null();
     let mut pso = null;
     assert_eq!(create_stream(null, &desc, &PIPELINE_IIDS[0], &mut pso), S_OK);
-    assert_eq!(host_pipeline(pso).expect("host refused the depth bounds pipeline").mesh, mesh);
+    assert_eq!(super::test_host_pipeline(pso).expect("host refused the depth bounds pipeline").mesh, mesh);
 
     let mut allocator = null;
     let mut list = null;
