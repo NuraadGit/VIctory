@@ -423,8 +423,10 @@ fn unused_elements(p: &Program, st: &Structured, res: &Resources) -> HashSet<Val
             }
             _ => {}
         }
-        // Lanes that do not run the instruction keep the old value.
-        if st.guards[site.0][site.1].is_some() || !plain || f.opsel != 0 {
+        // Lanes that do not run the instruction keep the old value, and 16-bit
+        // operations half of it.
+        let partial = !plain || f.opsel != 0 || name.contains("16");
+        if st.guards[site.0][site.1].is_some() || partial {
             for r in x.reads.iter().filter(|r| r.1 == v) {
                 work.extend(x.write(r.0));
             }

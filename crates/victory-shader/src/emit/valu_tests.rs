@@ -990,10 +990,23 @@ fn an_unused_array_element_may_hold_a_descriptor_address() {
         assert_eq!(got, elements[a as usize & 1], "{backend} case {i}");
     });
     assert_eq!(refusal(&[&fill, &read]), None, "without a join");
+    // The array's registers are reused: v7 is written, its old value not read.
+    let reuse = [
+        0x3A00_0000 | 7 << 17 | 1 << 9 | 256, // v_xor_b32 v7, v0, v1
+        vop1(0x001, 0, vgpr(7)),              // v_mov_b32 v0, v7
+    ];
+    let reused = build_valu_cs(&[&fill[..], &update, &read, &reuse].concat());
+    run_cases(&reused, &cases, |backend, i, [a, b, x, n], got| {
+        let elements = [x, if n & 1 == 1 { x } else { b }];
+        assert_eq!(got, elements[a as usize & 1] ^ a, "{backend} case {i}");
+    });
 
     let why = Some("a descriptor's address or format read as data");
     assert_eq!(refusal(&[&fill, &read, &xor_v7]), why);
     assert_eq!(refusal(&[&fill, &update, &read, &xor_v7]), why);
+    // v_fmac_f32 v7, v1, v2 adds to the old value.
+    let fmac = [0x2B << 25 | 7 << 17 | 2 << 9 | 257, reuse[1]];
+    assert_eq!(refusal(&[&fill, &update, &read, &fmac]), why);
     let m0 = &read[..1];
     // v_movrels_b32 v0, v7
     assert_eq!(refusal(&[&fill, m0, &[vop1(0x043, 0, vgpr(7))]]), why);
