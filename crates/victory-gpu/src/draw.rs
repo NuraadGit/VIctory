@@ -250,6 +250,27 @@ const ROOT_SRV_MAX: u64 = 4 << 20;
 /// Largest root UAV range refreshed, kept and copied back per submission.
 const ROOT_UAV_MAX: u64 = 2 << 20;
 
+/// The root SRV refresh cap in use: [`ROOT_SRV_MAX`], or what
+/// `VICTORY_ROOT_SRV_MB` says, in mebibytes (0: the rest of the copy). A
+/// page of a host copy that no bind ever refreshed reads zeros, so a
+/// program reading a root SRV past the cap gets zeros without any refusal
+/// or fault. The switch is there to measure whether the world does: compare
+/// a run at the default with one at 0.
+fn root_srv_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| root_srv_cap_from(std::env::var("VICTORY_ROOT_SRV_MB").ok().as_deref()))
+}
+
+/// [`root_srv_cap`] for the switch's value; anything but a number is the
+/// default.
+fn root_srv_cap_from(value: Option<&str>) -> u64 {
+    match value.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => u64::MAX,
+        Some(mb) => mb.saturating_mul(1 << 20),
+        None => ROOT_SRV_MAX,
+    }
+}
+
 /// The bytes of a root view's buffer copy (`left` remaining after its
 /// address) that a bind refreshes: constant buffers up to the D3D12 64 KiB
 /// maximum, SRVs and UAVs up to their caps, warning once when a cap cuts.
@@ -262,7 +283,7 @@ const ROOT_UAV_MAX: u64 = 2 << 20;
 fn root_len(left: u64, kind: RootView) -> u64 {
     let cap = match kind {
         RootView::Cbv => return left.min(1 << 16),
-        RootView::Srv => ROOT_SRV_MAX,
+        RootView::Srv => root_srv_cap(),
         RootView::Uav => ROOT_UAV_MAX,
     };
     if left > cap {
@@ -2070,7 +2091,12 @@ mod tests {
     fn root_view_ranges_are_capped() {
         let big = 1 << 30;
         assert_eq!(root_len(big, RootView::Cbv), 64 << 10);
-        assert_eq!(root_len(big, RootView::Srv), ROOT_SRV_MAX);
+        assert_eq!(root_len(big, RootView::Srv), root_srv_cap().min(big));
+        // The switch: mebibytes, 0 for the whole copy, the default otherwise.
+        assert_eq!(root_srv_cap_from(None), ROOT_SRV_MAX);
+        assert_eq!(root_srv_cap_from(Some("64")), 64 << 20);
+        assert_eq!(root_srv_cap_from(Some(" 0 ")), u64::MAX);
+        assert_eq!(root_srv_cap_from(Some("all")), ROOT_SRV_MAX);
         assert_eq!(root_len(big, RootView::Uav), ROOT_UAV_MAX);
         // A shorter remaining extent is taken whole.
         for kind in [RootView::Cbv, RootView::Srv, RootView::Uav] {
