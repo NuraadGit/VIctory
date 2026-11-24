@@ -34,6 +34,37 @@ turned down upstream.
   triangle geometry shaders translate and validate (two commits written
   for this tree, see "Changes made in this branch"). Nothing else
   changes in the offline count.
+- Update 9 adds the black-scene work: #704 (unknown-stride buffers,
+  on #193), #489 (root arguments from the spill table), #294 (root
+  UAVs) and #346 (indirect rectangle draws). **With it the title's
+  instance-culling compute programs translate for the first time: read
+  "What update 9 changes at run time" before comparing runs.**
+
+## What update 9 changes at run time
+
+Counted offline over the title's shaders (same method as below): 205
+more programs validate than at update 8 and none is lost (24,933 of
+25,889 for a 32-lane host). `a structured buffer of unknown stride` goes
+from 180 programs to 0, and 25 compute programs get past `a program the
+console structure cannot hold`. Of the 60 programs with "Cull" in their
+name, 60 validate (30 before): the 30 `InstanceCulling` compute programs
+were all stopped at unknown stride.
+
+Those programs have not run in the title on this tree. One tester's own
+port of #704 onto this tree at update 5 (likecrank-dotcom, on #704, RTX
+5060 Ti) had four of them translated and with pipelines in the title,
+and the run ended in `DEVICE_HUNG` after 111 s on a compute dispatch,
+where the tree without #704 held 600 to 900 s on other cards. That is
+one run of another integration, taken before the zero-element guard
+below, so it shows a direction to check, not a fault of this update.
+
+If a run at update 9 ends sooner than one at update 8:
+
+- compare with the head before it, `da605bc`;
+- run once with `VICTORY_SKIP_PIPELINES=<hashes>` naming the compute
+  programs the log shows as newly translated (the four that tester saw:
+  `17af15c4015cb4b6,55679a0547649d0b,fdd56d97a806bcca,89d08e561897d4e5`),
+  and say whether the run then lasts as before.
 
 ## What update 7 costs
 
@@ -84,6 +115,16 @@ sits.
   #841), so it is not every AMD card or driver.
 - `VICTORY_HEAP_GUARD=0` stays as a switch: the same shaders, with
   `u32::MAX` passed as the guard, so no index is redirected.
+- Looked at offline, the three programs are variants of one very large
+  compute program from the wave64 console flow (about 830 KB of DXIL,
+  1,480 blocks and 735 heap handles each), and the guard puts a compare
+  and a select in front of every handle. **To try (since `da605bc`):**
+  `VICTORY_HEAP_GUARD_FORM=umin` bounds the index with one `UMin`
+  instead (the same value), and `VICTORY_HEAP_GUARD_FORM=off` emits no
+  bound, as before #483. It is read when a program is translated, so
+  each run needs a shader cache of its own. Both forms pass #483's GPU
+  test here and validate the same programs; whether either gets past
+  AMD's compiler is not known.
 
 ## Reports from the title
 
@@ -256,6 +297,22 @@ and the name is its author's GitHub login.
   read as values come from `SV_Barycentrics`, and interpolation with
   computed barycentrics is evaluated from the vertex values. See
   "Changes made in this branch" for the fix that follows it.
+- #704 (r4tedx, on #193 by n-romanovich), at `fb8ea43`: a buffer whose
+  stride the container does not name is read through a raw view the
+  host makes beside every structured or typed buffer view, with a table
+  that gives each heap slot its stride and raw view. Fitted to this
+  tree's heap as title slots, dynamic slots, the guard slot, then the
+  raw views.
+- #489 (wrothgaril), head `279eac1` (contains #302): a compute program
+  whose root arguments all sit past the 16 user SGPRs reads them from
+  the spill table, as they were on entry.
+- #294 (dadou000), head `0050ce5`: root UAVs, and root views refreshed
+  further into their buffer. In this tree a root UAV is bound as a
+  bounded one-view table, as root SRVs are (#493).
+  `VICTORY_ROOT_SRV_MB=<mebibytes>` sets how much of a root SRV's copy
+  a bind refreshes (0: the rest of the copy).
+- #346 (BastienRdz), head `7ff1184`: indirect rectangle-list draws are
+  expanded on the GPU, adapted to #334's buffer-state tracker.
 - #587 (FibbS6), head `1052a90`: a mesh lane's vertex and primitive
   writes are kept inside the declared maxima, primitives no lane writes
   are culled first, and a barrier only some lanes reach is emitted
@@ -361,6 +418,8 @@ machines with newer drivers did not show it.
   it, `cargo test` sometimes never finishes, with several GPU tests stuck
   together. On the integration machine, before #433, 4 of 12 runs of the
   shader tests hung; with it, 0 of 12 did.
+- At update 9, one run of the same command: 525 passed, 0 failed, 7
+  ignored.
 - At update 8, one run of the same command with the machine at 100% CPU
   from other work: 491 passed, 1 failed, 7 ignored. The failure is
   `frame::tests::waits_end_on_ticks_and_count_frames`, which expects
@@ -595,6 +654,36 @@ is described in its merge or fix commit.
   lane mask's dword undefined at a data join) is **not** in the tree:
   it turned refusals into modules by handing out an undefined value
   where the console uses the mask's value.
+- **The black-scene branch (update 9)** came in as one merge of work
+  built on this tree at update 5; its own merge commits say what each
+  PR's conflicts were. In short: #294's root views keep #493's tables
+  for SRVs and tell #334's tracker the state each needs; #346's raw
+  state transitions of the title's buffers go through that tracker (its
+  expansion pass with the tracker is not covered by a test, only by a
+  title draw); #704's raw view pool sits after #483's guard slot and the
+  stride table has a zero entry for the guard. Merging it into update 8
+  conflicted in four places, all with the geometry path: the tree's
+  `NativeProgram::translation_ir` builds with the spill table for
+  stages other than geometry.
+- **#193's later safety changes, by hand (update 9):** #704's current
+  head carries #193's `f99b792`; merging that head conflicts with this
+  tree's heap layout in a dozen places, so its changes are applied to
+  the tree's own code: a buffer view of no elements is not made (a
+  tester's debug-layer run showed `CreateUnorderedAccessView` refusing
+  one and the device removed with `0x887A0001` right after), a shader
+  that reads the stride table while no view heap is bound is not run,
+  and a named stride that is no multiple of four is refused.
+- **`VICTORY_HEAP_GUARD_FORM`** (`emit/lower.rs`, since `da605bc`): see
+  "Known problem on AMD".
+- **Limits of the geometry programs (update 8)**, from an outside review
+  against another translator's measurements (c4k3ss, issue #293): one
+  stream; triangle input only; no `EMIT_CUT` message; no control flow in
+  the geometry body or past the copy shader's stream predicate; 16-bit
+  inputs and outputs refused; a vertex slot rewritten after its EMIT
+  translates with the earlier value; the record offsets rest on two
+  internal checks that hold on all 195 programs. Whether each geometry
+  program links with its vertex stage is not checked: the count
+  validates programs one at a time.
 - **A level-of-detail query passes its spatial coordinates only**
   (`emit/lower.rs`; the fix is MichaelSmithAI's, from #453's
   discussion): `image_get_lod` of an array texture passed the slice as a
@@ -604,14 +693,9 @@ is described in its merge or fix commit.
 
 ## Left out on purpose
 
-- #302: a spill-table load reads a register's current value, not its
-  entry value (follow-up in #489)
 - #442 (AnoHunted): reads barycentrics as values, as #453's first commit
   does; it refuses interpolation with computed barycentrics, which #453
   lowers, so the tree takes #453
-- #193: its fallback reads a structured view through a raw handle,
-  which returns 0 on NVIDIA; a title run with it (and other PRs) ended in
-  a 0x887A0001 device removal
 - #136: a16 bias read as f32; `image_gather4_l` ignores the sampler's
   address mode; 31 `E_OUTOFMEMORY` refusals in a title run. Two testers
   have since bisected it as making every frame black, loading screens
@@ -635,7 +719,6 @@ is described in its merge or fix commit.
   (updated upstream since, not re-reviewed)
 - #282: refuses rectangle lists whose start vertex is not a multiple of
   3 (updated upstream since, not re-reviewed)
-- #346: needs adapting to #334's buffer-state tracker
 - #190: overlaps #178 (included) for the Wine/Proton indirect clamp
 - #301: drops back-face stencil masks and the depth-bounds flag (updated
   upstream since); would also need combining with #158
@@ -647,8 +730,6 @@ is described in its merge or fix commit.
 - #185: a draft
 - #135: overlaps #336 and #251 (included) on the dynamic descriptor
   pool
-- #294: root views refresh the whole rest of a large buffer copy
-  (updated upstream since, not re-reviewed)
 - #367: closed as a duplicate of #334
 - #159 (r4tedx): needs adapting to #334's state tracker first
 - #189 (alfycs): another way to run wave64 compute on 32-lane hosts. It
@@ -667,10 +748,11 @@ is described in its merge or fix commit.
   this tree behaves the same has not been run.
 - **The black 3D scene.** The runs without a hang still showed a black
   scene in the world.
-- **The top rows of issue #293's table** ("an address in an SGPR that is
-  no root parameter", "a descriptor neither loaded nor built", "a
-  structured buffer of unknown stride", "a scalar memory read as data").
-  No PR in this tree fixes them.
+- **Some top rows of issue #293's table** ("a descriptor neither loaded
+  nor built", "a scalar memory read as data"). No PR in this tree fixes
+  them. "A structured buffer of unknown stride" is fixed since update 9
+  (#704), and the geometry programs of "an address in an SGPR that is
+  no root parameter" since update 8.
 - **Faults on textures the title freed earlier.**
 
 ## How to build
@@ -714,7 +796,11 @@ Please include:
 - **Whether the world shows geometry**, in words.
 - **The variables you set**: `VICTORY_SHADER_LOOP_LIMIT`,
   `VICTORY_SKIP_WAVE64`, `VICTORY_NO_WATCHDOG`, `VICTORY_ROOT_SRV_DIRECT`,
-  `VICTORY_HEAP_GUARD`.
+  `VICTORY_HEAP_GUARD`, `VICTORY_HEAP_GUARD_FORM`, `VICTORY_ROOT_SRV_MB`,
+  `VICTORY_SKIP_PIPELINES`.
+- **For the black scene:** a target dump with `VICTORY_ROOT_SRV_MB` at
+  its default and at 0, to see whether the G-buffer fills when root
+  SRVs are refreshed to the end of their copy.
 - **These log lines, if they appear**: `a root SRV not on 16 bytes reads
   zeros`, `a root SRV without a bound view heap`, `title slot past the
   host heap` (with its highest index), and the `dropped=` count of
