@@ -232,6 +232,7 @@ fn host_shader(stage: &'static str, entry: PCSTR, target: PCSTR) -> Arc<Shader> 
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                stride_table: false,
             },
             used: Vec::new(),
         })
