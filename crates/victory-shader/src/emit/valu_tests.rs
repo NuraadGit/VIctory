@@ -1363,10 +1363,12 @@ fn a_spilled_root_uav_program_translates_and_runs() {
     assert!(ran > 0);
 }
 
-/// 16 user SGPRs and the group id enabled: GroupId.x is in s16, the SGPR
-/// the spill rule also uses for table dword 0. Such a program is left alone.
+/// 16 user SGPRs and the group id enabled: GroupId.x is in s16, the number
+/// table dword 0 has as a spill argument. The two are apart: the program
+/// reads the root constant from the table and the group id from s16, as on
+/// the console.
 #[test]
-fn a_group_id_in_s16_keeps_the_spill_rule_off() {
+fn a_group_id_in_s16_reads_beside_the_spill_table() {
     let mut words = Vec::new();
     words.push(s_mov_b32(2, 0));
     words.extend_from_slice(&[0x8703_FF01, 0x0000_00FF]);
@@ -1392,42 +1394,53 @@ fn a_group_id_in_s16_keeps_the_spill_rule_off() {
         },
         spilled_desc(18, 1),
     ];
-    // Left alone: the program stops as it did before the spill rule.
-    let refused = spilled_cs(
+    // Without the spill rule the program stops, as it did before the rule.
+    let plain = spilled_cs(
         &words,
         layout.clone(),
         vec![spilled_uav(18, 1)],
         16 << 1 | 1 << 7,
-        None,
+        Some(false),
     );
-    assert!(refused.is_err(), "the rule must not apply with GroupId.x in s16");
-    // With the rule forced, the root constant and the group id are apart:
-    // a spill argument is no longer the physical SGPR of its number.
+    assert!(plain.is_err());
+    // The rule as `NativeProgram::spilled` decides it: it applies.
     let shader = spilled_cs(
         &words,
         layout,
         vec![spilled_uav(18, 1)],
         16 << 1 | 1 << 7,
-        Some(true),
+        None,
     )
-    .unwrap_or_else(|e| panic!("forced spill rule: {e}"));
-    let Ok(host) = Host::new(false) else {
-        return;
-    };
-    let (root, pso) = host.compute_pipeline(&shader).unwrap();
-    let constants: Vec<u32> = (0..shader.user_data_dwords()).map(|i| 100 + i).collect();
-    let out = host
-        .dispatch(
-            &root,
-            &pso,
-            &Dispatch {
-                roots: vec![(0, Root::Constants(constants)), (1, Root::Uav(4))],
-                views: &[],
-                samplers: &[],
-                groups: [1, 1, 1],
-            },
-        )
-        .unwrap();
-    // The console: [116 (root constant), 0 (group 0)].
-    assert_eq!(&out[0][..2], &[116, 0]);
+    .unwrap_or_else(|e| panic!("with spill rule: {e}"));
+    // s16 is read as the group id, not as a constant of the root signature.
+    let ops = super::shader::last_summary();
+    assert!(ops.contains("groupId"), "no group id read: {ops}");
+    assert_eq!(shader.root_uavs, vec![1]);
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let constants: Vec<u32> = (0..shader.user_data_dwords()).map(|i| 100 + i).collect();
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(constants)), (1, Root::Uav(4))],
+                    views: &[],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        eprintln!("{label}: root UAV readback {:?}", &out[0][..2]);
+        // The console: [116 (root constant), 0 (group 0)].
+        assert_eq!(&out[0][..2], &[116, 0], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0);
 }
