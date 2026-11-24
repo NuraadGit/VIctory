@@ -269,13 +269,12 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
         })?;
     // A compute program whose root arguments all sit past the 16 user SGPRs
     // finds them through the spill table `s[0:1]` points to.
-    let spilled = native.stage == HwStage::Cs
-        && !native.layout.is_empty()
-        && native
-            .layout
-            .iter()
-            .all(|r| native.stage.user_sgpr(r.user_data) >= 16);
-    let mut p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)?;
+    let mut p = ir::build_with(
+        &native.patched_code(),
+        native.wave64,
+        native.vgprs,
+        native.spilled(),
+    )?;
     crate::sgpr_spill::forward(&mut p);
     let res = resource::track(&p, &native.layout, native.stage)?;
     let io = io::raise(&p, &native)?;

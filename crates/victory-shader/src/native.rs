@@ -186,6 +186,29 @@ impl NativeProgram {
         }
         code
     }
+
+    /// Whether the root arguments arrive through the spill table `s[0:1]`
+    /// points to: a compute program whose root parameters all sit past the
+    /// 16 user SGPRs. The table's dwords are then stood for by SGPRs from
+    /// s16 up, so a program with a system SGPR (a thread-group id component
+    /// or the group info) at s16 or above is left alone: the two would name
+    /// the same register.
+    pub fn spilled(&self) -> bool {
+        let system_clear = match &self.io {
+            StageIo::Cs(io) => {
+                let (ids, info) = io.system_sgprs();
+                ids.into_iter().chain([info]).flatten().all(|s| s < 16)
+            }
+            _ => true,
+        };
+        self.stage == HwStage::Cs
+            && !self.layout.is_empty()
+            && system_clear
+            && self
+                .layout
+                .iter()
+                .all(|r| self.stage.user_sgpr(r.user_data) >= 16)
+    }
 }
 
 /// What a semantic is, as the stage data names it.
@@ -1015,6 +1038,68 @@ mod tests {
         };
         assert_eq!(cs.system_sgprs(), ([Some(6), Some(7), Some(8)], None));
         assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (3, 0));
+    }
+
+    /// A compute program with one root parameter at each user-data dword of
+    /// `at`, and `rsrc2` for its SGPR counts.
+    fn compute_with(at: &[u8], rsrc2: u32) -> NativeProgram {
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: at
+                .iter()
+                .enumerate()
+                .map(|(slot, &user_data)| RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data,
+                    slot: slot as u8,
+                })
+                .collect(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2,
+                threads: [1, 1, 1],
+            }),
+            code: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn spill_table_rule_needs_every_argument_past_the_user_sgprs() {
+        // All root arguments at user data 16 and up, no system SGPR.
+        assert!(compute_with(&[16, 18], 16 << 1).spilled());
+        // One argument in a user SGPR: the program has a mixed layout.
+        assert!(!compute_with(&[4, 16], 16 << 1).spilled());
+        // No root parameter at all.
+        assert!(!compute_with(&[], 16 << 1).spilled());
+        // Another stage never uses the table.
+        let mut vs = compute_with(&[16], 16 << 1);
+        vs.stage = HwStage::Vs;
+        vs.io = StageIo::None;
+        assert!(!vs.spilled());
+    }
+
+    #[test]
+    fn spill_table_rule_leaves_a_system_sgpr_at_s16_alone() {
+        // 16 user SGPRs and the group id's x: it arrives in s16, the SGPR
+        // that stands for table dword 0.
+        let cs = compute_with(&[16, 18], 16 << 1 | 1 << 7);
+        let StageIo::Cs(io) = &cs.io else {
+            unreachable!()
+        };
+        assert_eq!(io.system_sgprs().0[0], Some(16));
+        assert!(!cs.spilled());
+        // The group info alone, after 16 user SGPRs.
+        assert!(!compute_with(&[16], 16 << 1 | 1 << 10).spilled());
+        // 12 user SGPRs: x, y, z and the info sit in s12 to s15, below the
+        // SGPRs the table stands for.
+        assert!(compute_with(&[16], 12 << 1 | 0xF << 7).spilled());
+        // 13 user SGPRs: the info reaches s16.
+        assert!(!compute_with(&[16], 13 << 1 | 0xF << 7).spilled());
     }
 
     #[test]
