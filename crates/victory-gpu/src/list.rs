@@ -259,6 +259,8 @@ extern "system" fn close(this: This) -> HRESULT {
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+    // A held submission of this list runs before it is recorded again.
+    crate::queue::held::list_reset(this);
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -1532,6 +1534,44 @@ mod tests {
             }
         }
         release(allocator);
+    }
+
+    /// The title may reset a list as soon as it is submitted: a held
+    /// submission of it runs first, as recorded, so the host never executes
+    /// the list the title is recording again (an invalid call that removes
+    /// the device).
+    #[test]
+    #[cfg(windows)]
+    fn a_held_list_the_title_resets_runs_first() {
+        if crate::host::host().is_none() {
+            eprintln!("no host GPU; skipped");
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+        const PAYLOAD: u64 = 0x5a55_a11c;
+        // Payload, a counter nothing writes, result.
+        let words = Box::new([PAYLOAD, 0u64, 0u64]);
+        let at = |i: usize| (&raw const words[i]) as u64;
+        wait64(list, at(1), 7, 1); // GREATER_EQUAL
+        copy_memory(list, at(2), at(0), 8, 0);
+        assert_eq!(close(list), S_OK);
+        let mut q = null;
+        let desc = crate::queue::QueueDesc::default();
+        assert_eq!(crate::queue::create(null, &desc, &crate::queue::QUEUE_IIDS[0], &mut q), S_OK);
+        crate::queue::execute(q, 1, &list);
+        assert!(crate::queue::held::holds(q), "the list waits");
+        assert_eq!(words[2], 0, "nothing ran yet");
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(!crate::queue::held::holds(q), "the reset ran it");
+        assert_eq!(words[2], PAYLOAD, "as it was submitted");
+        for o in [list, q, allocator] {
+            object::release_ref(o);
+        }
     }
 
     /// A wait that never ends holds its queue for 2 s, not for ever.

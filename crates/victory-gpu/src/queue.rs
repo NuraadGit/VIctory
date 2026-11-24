@@ -246,6 +246,31 @@ pub(crate) mod held {
         }
     }
 
+    /// The title resets `list`, which D3D12 allows as soon as it is
+    /// submitted: held work naming it runs first, up to and including it and
+    /// whole, so the host executes the commands the title submitted and not
+    /// the ones it records next. Executing a list the title has reopened is
+    /// an invalid call, and the device is removed.
+    pub(crate) fn list_reset(list: This) {
+        let list = list as usize;
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        for q in held.iter_mut() {
+            let Some(at) = q
+                .held
+                .iter()
+                .position(|w| matches!(w, Held::Lists(l) if l.contains(&list)))
+            else {
+                continue;
+            };
+            let due: Vec<Held> = q.held.drain(..=at).collect();
+            for work in due {
+                let _ = run_kept(work, true);
+            }
+            q.since = Instant::now();
+        }
+        held.retain(|q| !q.held.is_empty());
+    }
+
     /// Whether `queue` holds work (for tests).
     #[cfg(test)]
     pub(crate) fn holds(queue: This) -> bool {
