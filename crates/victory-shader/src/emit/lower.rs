@@ -242,6 +242,7 @@ struct Lower<'a> {
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
+    unused_elements: HashSet<Value>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
@@ -601,6 +602,132 @@ fn sample_form(name: &str) -> Option<SampleForm> {
     Some(f)
 }
 
+/// VGPR copies (`v_mov_b32`) of descriptor dwords that only M0-relative moves
+/// reach, as an element past the array's first. The compiler fills an indexed
+/// array from a run of SGPRs, which past the elements the program uses holds
+/// whatever is there, and the moves name every VGPR up to the program's last.
+fn unused_elements(p: &Program, st: &Structured, res: &Resources) -> HashSet<Value> {
+    let insts = || {
+        p.blocks.iter().enumerate().flat_map(|(b, block)| {
+            block
+                .insts
+                .iter()
+                .enumerate()
+                .map(move |(i, x)| ((b, i), x))
+        })
+    };
+    if !insts().any(|(_, x)| x.name().starts_with("v_movrel")) {
+        return HashSet::new();
+    }
+    let loads: HashSet<Site> = res
+        .descriptors
+        .iter()
+        .flat_map(|d| d.source.leaves())
+        .filter_map(|l| match *l {
+            Source::Loaded { load, .. } => Some(load),
+            _ => None,
+        })
+        .collect();
+    let dwords: HashSet<Value> = loads
+        .iter()
+        .map(|&(b, i)| &p.blocks[b].insts[i])
+        .filter(|x| x.name().starts_with("s_load_dword"))
+        .flat_map(|x| x.writes.iter().map(|w| w.1))
+        .collect();
+    // The instructions and joins that read each value.
+    let mut readers: HashMap<Value, Vec<Site>> = HashMap::new();
+    for (site, x) in insts() {
+        for &(_, v) in &x.reads {
+            readers.entry(v).or_default().push(site);
+        }
+    }
+    let mut joins: HashMap<Value, Vec<Value>> = HashMap::new();
+    for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+        for &v in &phi.args {
+            joins.entry(v).or_default().push(phi.value);
+        }
+    }
+    // Whether instruction `site` reads value `v` in a way that keeps it an
+    // unused element; the values that then hold it go to `work`.
+    let keeps = |site: Site, v: Value, work: &mut Vec<Value>| {
+        let x: &Inst = &p.blocks[site.0].insts[site.1];
+        let Fields::Valu(f) = &x.fields else {
+            return false;
+        };
+        let name = x.name();
+        let operand = |o: Option<&Operand>| match o {
+            Some(&Operand::Vector { reg, .. }) => Some(Reg::V(reg)),
+            _ => None,
+        };
+        let (src, dst) = (operand(f.src.first()), operand(f.dst.as_ref()));
+        let first = |reg: Option<Reg>| reg.is_some_and(|r| x.read(r) == Some(v));
+        let plain = f.sdwa.is_none() && f.dpp.is_none() && f.abs == 0 && f.neg == 0;
+        match name {
+            // Element 0 or the value stored.
+            "v_movreld_b32" if first(src) || first(dst) => return false,
+            // Every other element keeps its value where M0 names another.
+            "v_movreld_b32" => {
+                for r in x.reads.iter().filter(|r| r.1 == v && Some(r.0) != src) {
+                    work.extend(x.write(r.0));
+                }
+                return true;
+            }
+            "v_movrels_b32" if first(src) => return false,
+            "v_movrels_b32" => {}
+            "v_mov_b32" if plain && !f.clamp && f.omod == 0 && first(src) => {
+                work.extend(dst.and_then(|r| x.write(r)));
+                return true;
+            }
+            _ if crate::ir::operand_reads(p, x)
+                .iter()
+                .any(|&r| x.read(r) == Some(v)) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+        // Lanes that do not run the instruction keep the old value, and 16-bit
+        // operations half of it.
+        let partial = !plain || f.opsel != 0 || name.contains("16");
+        if st.guards[site.0][site.1].is_some() || partial {
+            for r in x.reads.iter().filter(|r| r.1 == v) {
+                work.extend(x.write(r.0));
+            }
+        }
+        true
+    };
+    let mut out = HashSet::new();
+    for (_, x) in insts().filter(|(_, x)| x.name() == "v_mov_b32") {
+        let Fields::Valu(f) = &x.fields else { continue };
+        let (Some(&Operand::Scalar { code, .. }), Some(&Operand::Vector { reg, .. })) =
+            (f.src.first(), f.dst.as_ref())
+        else {
+            continue;
+        };
+        let from = x.read(Reg::S(code));
+        let (Some(_), Some(copy)) = (from.filter(|v| dwords.contains(v)), x.write(Reg::V(reg)))
+        else {
+            continue;
+        };
+        let mut seen = HashSet::new();
+        let mut work = vec![copy];
+        let mut unused = true;
+        while let Some(v) = work.pop().filter(|_| unused) {
+            if !seen.insert(v) {
+                continue;
+            }
+            work.extend(joins.get(&v).into_iter().flatten());
+            unused = readers
+                .get(&v)
+                .is_none_or(|r| r.iter().all(|&site| keeps(site, v, &mut work)));
+        }
+        if unused {
+            out.insert(copy);
+        }
+    }
+    out
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -869,6 +996,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
+            unused_elements: unused_elements(p, x.st, x.res),
             descriptors: x
                 .res
                 .descriptors
@@ -5368,7 +5496,22 @@ impl<'a> Lower<'a> {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
-                let a = s(self, 0)?;
+                let a = match s(self, 0) {
+                    // shortcut: 0 for a descriptor's address or format in an
+                    // array element the program does not use, assuming M0
+                    // never names it (`unused_elements`).
+                    Err(_)
+                        if v.dst.as_ref().is_some_and(|d| match *d {
+                            Operand::Vector { reg, .. } => inst
+                                .write(Reg::V(reg))
+                                .is_some_and(|w| self.unused_elements.contains(&w)),
+                            _ => false,
+                        }) =>
+                    {
+                        self.s.m.i32(0)
+                    }
+                    a => a?,
+                };
                 int(self, a)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"

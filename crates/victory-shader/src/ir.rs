@@ -378,7 +378,13 @@ pub fn build_with(
             blocks[b].insts.extend(
                 (0..load.dwords).map(|k| spill_copy(load.dst + k, load.first + k, machine.offset)),
             );
-        } else if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+        } else if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+            // Lanes disabled in EXEC keep the old value.
+            for w in writes.iter().filter(|w| matches!(w, Reg::V(_))) {
+                if !reads.contains(w) {
+                    reads.push(*w);
+                }
+            }
             let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
             blocks[b].insts.push(Inst {
                 machine,
@@ -891,6 +897,29 @@ const DROPPED: &[&str] = &[
 /// Registers read, registers written.
 type Effects = (Vec<Reg>, Vec<Reg>);
 
+/// The registers `inst` of `p` reads as operands: its reads without the old
+/// value of a VGPR it only writes.
+pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
+    let name = inst.name();
+    let lanes = 1 + u8::from(p.wave64);
+    let Ok(Some((mut reads, writes))) = effects(&inst.machine, &inst.fields, name, lanes, p.vgprs)
+    else {
+        return Vec::new();
+    };
+    // These compute with the destination's old value, or keep parts of it.
+    let accumulates = name.contains("mac_")
+        || name.starts_with("v_dot2c")
+        || name.starts_with("v_dot4c")
+        || name.starts_with("v_interp_p2")
+        || name.starts_with("v_permlane")
+        || name.starts_with("v_movrel")
+        || name == "v_writelane_b32";
+    if accumulates {
+        reads.extend(writes.iter().filter(|w| matches!(w, Reg::V(_))));
+    }
+    reads
+}
+
 /// Registers an instruction reads and writes, one per dword, or `None` if
 /// the IR drops it.
 fn effects(
@@ -1159,8 +1188,6 @@ fn effects(
     }
     if vector {
         r.extend(mask(EXEC));
-        // Lanes disabled in EXEC keep the old value.
-        r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
     }
     let mut seen = Vec::with_capacity(r.len());
     r.retain(|reg| {
