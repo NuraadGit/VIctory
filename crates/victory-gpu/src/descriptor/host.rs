@@ -411,6 +411,46 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// Makes slot `index` (a dynamic one) a raw unordered access view of
+    /// `len` bytes (at least 4) of `buffer` from byte `offset` (a multiple
+    /// of 16): a root UAV with a size, whose stores past it are dropped and
+    /// whose loads past it return zeros instead of reaching whatever the
+    /// host placed after the range.
+    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        let Some(host) = host() else { return };
+        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: offset / 4,
+                    NumElements: elements,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a slot of our heap and a live buffer covering the range.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                buffer,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                self.cpu(index),
+            )
+        };
+        self.keep(index, Some(buffer.clone()));
+    }
+
+    /// Makes slot `index` a raw unordered access view of nothing: stores
+    /// are dropped, loads return zeros.
+    pub(crate) fn null_raw_uav_at(&self, index: u32) {
+        null_buffer_uav(self.cpu(index));
+        self.keep(index, None);
+    }
+
     /// Whether this is a sampler heap.
     pub(crate) fn is_sampler(&self) -> bool {
         self.sampler
@@ -1159,6 +1199,32 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+    };
+}
+
+/// A raw unordered access buffer view of nothing (as translated shaders
+/// declare root UAVs): stores are dropped, loads return zeros.
+fn null_buffer_uav(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    unsafe {
+        host.device.CreateUnorderedAccessView(
+            None::<&ID3D12Resource>,
+            None::<&ID3D12Resource>,
+            Some(&desc),
+            at,
+        )
     };
 }
 

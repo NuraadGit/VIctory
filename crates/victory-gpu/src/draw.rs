@@ -84,6 +84,9 @@ pub(crate) struct State {
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    /// Root UAVs bound as one-view tables in this list: (host heap, title
+    /// address, the host copy viewed or 0 for a null view) → dynamic slot.
+    root_uav_slots: std::collections::HashMap<(usize, u64, usize), u32>,
 }
 
 impl Drop for State {
@@ -269,6 +272,36 @@ fn root_len(left: u64, kind: RootView) -> u64 {
         }
     }
     left.min(cap)
+}
+
+/// What a root UAV at title address `address` views when bound as a table
+/// ([`State::root_uav_table`]): the host copy, the view's byte offset in
+/// it and its length in bytes, a multiple of 4. The length is what a root
+/// UAV descriptor refreshes and copies back ([`root_len`]), so a shader
+/// stores nothing that the title does not get back. None (a null view)
+/// for a null address, one outside mapped title memory, one whose range
+/// holds no dword, and one not on 16 bytes of its copy: the host starts
+/// raw views only there (the console on 4), and a view from the 16 bytes
+/// below would shift every store and load.
+/// shortcut: such an address is not served at all (warned of once); the
+/// shader would have to add the difference to each offset.
+fn root_uav_range(address: u64) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    if address == 0 {
+        return None;
+    }
+    let shadow = crate::shadow::find(address, 1)?;
+    // SAFETY: a live buffer.
+    let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+    let offset = shadow.gpu(address) - base;
+    if !offset.is_multiple_of(16) {
+        once!(
+            address = format_args!("{address:#x}"),
+            "a root UAV not on 16 bytes gets a null view: its stores are dropped, its loads read zeros"
+        );
+        return None;
+    }
+    let len = root_len(shadow.left(address), RootView::Uav) & !3;
+    (len != 0).then_some((shadow, offset, len))
 }
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -654,9 +687,15 @@ impl State {
                         bound_params |= 1u64 << param;
                     }
                     let uav = kind == RootView::Uav;
-                    if kind == RootView::Srv && crate::pipeline::host::bounded_root_srvs() {
-                        // A one-view table (#493): an unset or unmapped
-                        // address gets a null view there, not a fallback.
+                    let table = match kind {
+                        RootView::Cbv => false,
+                        RootView::Srv => crate::pipeline::host::bounded_root_srvs(),
+                        RootView::Uav => crate::pipeline::host::bounded_root_uavs(),
+                    };
+                    if table {
+                        // A one-view table (#493, and the same for UAVs):
+                        // an unset or unmapped address gets a null view
+                        // there, not a fallback.
                         let address = match self.roots_ref(compute).get(usize::from(slot)) {
                             Some(&Root::View(address)) => Some(address),
                             _ => {
@@ -664,7 +703,12 @@ impl State {
                                 None
                             }
                         };
-                        if !self.root_srv_table(list, address, param, compute) {
+                        let bound = if uav {
+                            self.root_uav_table(list, address, param, compute)
+                        } else {
+                            self.root_srv_table(list, address, param, compute)
+                        };
+                        if !bound {
                             return false;
                         }
                         continue;
@@ -808,6 +852,75 @@ impl State {
         true
     }
 
+    /// Binds a root UAV as a one-view table (see
+    /// [`crate::pipeline::host::bounded_root_uavs`]): a raw unordered
+    /// access view of the range of the title buffer's host copy that
+    /// [`root_uav_range`] gives, or a null view (stores dropped, loads
+    /// zero) where it gives none. Does for that range what [`root_view`]
+    /// does for a root UAV descriptor: refreshed, copied back to title
+    /// memory after the submission, the copy put in its written state. One
+    /// slot per address and copy per list. False if no dynamic slot could
+    /// be had (the draw or dispatch is dropped).
+    fn root_uav_table(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+        param: u32,
+        compute: bool,
+    ) -> bool {
+        let Some((heap, host)) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
+        else {
+            once!("a root UAV without a bound view heap: the draw or dispatch is dropped");
+            return false;
+        };
+        let view = address.and_then(root_uav_range);
+        // By copy as well as address: a view made of an address without a
+        // copy (null), or of a copy the title has since released, must
+        // not serve a later bind in the list that finds another.
+        let key = (
+            std::ptr::from_ref(heap) as usize,
+            address.unwrap_or(0),
+            view.as_ref().map_or(0, |v| v.0.buffer.as_raw() as usize),
+        );
+        let index = match self.root_uav_slots.get(&key) {
+            Some(&index) => index,
+            None => {
+                let Some(index) = host.dynamic(1) else {
+                    return false;
+                };
+                self.dynamic.push((key.0, index, 1));
+                self.root_uav_slots.insert(key, index);
+                match &view {
+                    Some((s, offset, len)) => host.raw_uav_at(index, &s.buffer, *offset, *len),
+                    None => host.null_raw_uav_at(index),
+                }
+                index
+            }
+        };
+        if let (Some(a), Some((s, _, len))) = (address, &view) {
+            // As [`root_view`], for exactly the bytes of the view: what a
+            // shader can store is what is copied back.
+            s.refresh(list, a, *len);
+            s.gpu_writes(list, a, *len);
+            list.buffer_state(&s.buffer, crate::host::BUFFER_WRITE);
+        }
+        let handle = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound view heap.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, handle);
+            }
+        }
+        true
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
@@ -879,6 +992,16 @@ impl State {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
+                    // A root UAV bound as a table views less than the rest
+                    // of its copy, or nothing.
+                    if stage.root_uavs.iter().any(|r| r.0 == slot)
+                        && crate::pipeline::host::bounded_root_uavs()
+                    {
+                        let _ = match root_uav_range(*address) {
+                            Some((_, _, len)) => write!(text, " uav view {len:#x} bytes"),
+                            None => write!(text, " null uav view"),
+                        };
+                    }
                 }
             }
         }
@@ -1799,6 +1922,117 @@ mod tests {
         (shader, used)
     }
 
+    /// What [`build_root_uav_cs`]'s program stores in range, before the
+    /// exclusive-or with what it loads past the view.
+    const UAV_IN_RANGE: u32 = 0x5EED_0001;
+    /// What it stores out of range.
+    const UAV_OUT_OF_RANGE: u32 = 0x0BAD_0002;
+    /// Byte offsets from the root UAV's address: its in-range store, its
+    /// load and store past a 2 MiB view, and its store far past any copy.
+    const UAV_INSIDE: usize = 0x18_0000;
+    const UAV_PAST: usize = 0x28_0000;
+    const UAV_FAR: u32 = 0x3000_0000;
+
+    /// Synthetic GFX10 compute shader with one root UAV (slot 0). It loads
+    /// the dword at `+2.5 MiB` ([`UAV_PAST`]), stores that exclusive-or
+    /// [`UAV_IN_RANGE`] at `+1.5 MiB` ([`UAV_INSIDE`]), then stores
+    /// [`UAV_OUT_OF_RANGE`] at `+2.5 MiB` and at `+768 MiB` ([`UAV_FAR`]).
+    fn build_root_uav_cs() -> (victory_shader::emit::HostShader, Vec<UsedResource>) {
+        let s_mov_b32 =
+            |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32;
+        let v_mov_b32 =
+            |vdst: u8, value: u32| [0x7E00_0000 | (vdst as u32) << 17 | 0x001 << 9 | 0xFF, value];
+        let v_xor_b32 = |vdst: u8, value: u32, vsrc1: u8| {
+            [
+                0x1D << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | 0xFF,
+                value,
+            ]
+        };
+        let buffer_load_dword_offen = |vdst: u8, vaddr: u8, srsrc: u8| -> [u32; 2] {
+            [
+                0x38 << 26 | 0x0C << 18 | (1 << 12),
+                0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdst as u32) << 8 | vaddr as u32,
+            ]
+        };
+        let buffer_store_dword_offen = |vdata: u8, vaddr: u8, srsrc: u8| -> [u32; 2] {
+            [
+                0x38 << 26 | 0x1C << 18 | (1 << 12),
+                0x80 << 24
+                    | ((srsrc as u32 >> 2) & 0x1F) << 16
+                    | (vdata as u32) << 8
+                    | vaddr as u32,
+            ]
+        };
+
+        let mut words = Vec::new();
+        // s[0:1] = UAV 0; its descriptor in s[12:15].
+        words.push(s_mov_b32(12, 0));
+        words.push(s_mov_b32(13, 1));
+        words.push(s_mov_b32(14, 0xC1));
+        words.extend_from_slice(&[s_mov_b32(15, 0xFF), 0x3101_4FAC]);
+        // v1 = uav[+2.5 MiB]; uav[+1.5 MiB] = v1 ^ UAV_IN_RANGE.
+        words.extend_from_slice(&v_mov_b32(0, UAV_PAST as u32));
+        words.extend_from_slice(&buffer_load_dword_offen(1, 0, 12));
+        words.extend_from_slice(&v_xor_b32(2, UAV_IN_RANGE, 1));
+        words.extend_from_slice(&v_mov_b32(3, UAV_INSIDE as u32));
+        words.extend_from_slice(&buffer_store_dword_offen(2, 3, 12));
+        // uav[+2.5 MiB] = uav[+768 MiB] = UAV_OUT_OF_RANGE.
+        words.extend_from_slice(&v_mov_b32(4, UAV_OUT_OF_RANGE));
+        words.extend_from_slice(&buffer_store_dword_offen(4, 0, 12));
+        words.extend_from_slice(&v_mov_b32(5, UAV_FAR));
+        words.extend_from_slice(&buffer_store_dword_offen(4, 5, 12));
+        words.push(0xBF81_0000); // s_endpgm
+
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        }];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: used.clone(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = victory_shader::ir::build(&native.code, false, 8).unwrap();
+        let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let target = victory_shader::emit::Target::ANY;
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res, target).unwrap();
+        assert_eq!(shader.root_uavs, vec![0]);
+        (shader, used)
+    }
+
+    /// Whether the host's device is still there.
+    fn device_alive(host: &crate::host::Host) -> bool {
+        // SAFETY: a live device.
+        unsafe { host.device.GetDeviceRemovedReason() }.is_ok()
+    }
+
     #[test]
     fn null_and_unmapped_root_views_use_safe_distinct_fallbacks() {
         assert!(crate::shadow::find(0, 1).is_none());
@@ -1918,10 +2152,13 @@ mod tests {
         }
 
         // 1) Dispatch with slot 0 unset, slot 1 = null (0x0), slot 2 = unmapped VA:
-        //    ZERO fallback serves CBV/SRV as 0, SINK absorbs the UAV store at +1.5 MiB
-        //    without faulting or dirtying ZERO.
+        //    the CBV reads the ZERO fallback and the SRV a null view, both as
+        //    0; the UAV store at +1.5 MiB must neither fault nor dirty what
+        //    they read. As a one-view table the UAV is a null view, which
+        //    drops the store; with VICTORY_ROOT_UAV_DIRECT=1 the SINK
+        //    fallback absorbs it.
         let list = host.new_list().expect("new_list");
-        // Root SRVs are one-view tables in the bound view heap.
+        // Root SRVs and UAVs are one-view tables in the bound view heap.
         let heap = crate::descriptor::test_view_heap(16);
         let mut state = State::default();
         state.set_pipeline(pso);
@@ -1932,9 +2169,10 @@ mod tests {
         list.close();
         host.execute(&[&list]);
 
-        // 2) Dispatch with CBV & SRV still unbound (verifying ZERO remained 0!)
-        //    and UAV bound to `uav_buf`: uav_buf[+1.5 MiB] must receive
-        //    0 ^ 0 ^ 0xA5A5_5A5A = 0xA5A5_5A5A in CPU title memory.
+        // 2) Dispatch with CBV & SRV still unbound (verifying they still read
+        //    0 after step 1's store!) and UAV bound to `uav_buf`:
+        //    uav_buf[+1.5 MiB] must receive 0 ^ 0 ^ 0xA5A5_5A5A = 0xA5A5_5A5A
+        //    in CPU title memory.
         list.reset();
         state.reset(pso);
         state.set_heaps(&[heap]);
@@ -1946,7 +2184,7 @@ mod tests {
         let from_zero = unsafe { uav_buf.ptr.add(off).cast::<u32>().read() };
         assert_eq!(
             from_zero, 0xA5A5_5A5A,
-            "sink UAV write must not dirty the zero fallback buffer"
+            "the store through the unmapped root UAV must not dirty what unset views read"
         );
 
         // 3) Dispatch with all three root views bound (SRV reading +1.5 MiB and
@@ -1990,6 +2228,140 @@ mod tests {
         crate::shadow::unregister(srv_buf.ptr as usize, srv_buf.addr());
         crate::shadow::unregister(uav_buf.ptr as usize, uav_buf.addr());
         crate::shadow::unregister(cbv_buf.ptr as usize, cbv_buf.addr());
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
+        assert_eq!(release(pso), 0);
+    }
+
+    /// A root UAV bound as a one-view table ends where its refresh and
+    /// copy-back range does: a store past that is dropped and a load past
+    /// it reads 0, inside the host copy and far past it, without a fault,
+    /// while a store inside in the same dispatch reaches title memory.
+    #[test]
+    fn a_root_uav_store_past_its_view_is_dropped() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !crate::pipeline::host::bounded_root_uavs() {
+            // A root descriptor has no end: the program's far store would
+            // fault the GPU.
+            return;
+        }
+        let (shader, used) = build_root_uav_cs();
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+
+        // 3 MiB of title memory: the view is its first 2 MiB (ROOT_UAV_MAX),
+        // so +2.5 MiB is past the view and inside the copy.
+        let len = 3 << 20;
+        let buf = Allocation::watched(len);
+        let base = buf.addr();
+        crate::shadow::register(buf.ptr as usize, base, len as u64);
+        let marker = 0x0C0F_FEE0u32;
+        // SAFETY: inside the committed allocation.
+        unsafe { buf.ptr.add(UAV_PAST).cast::<u32>().write(marker) };
+
+        // The whole copy brought up to date (as a root SRV: 3 MiB), so that
+        // it holds the marker where the program loads and stores past the
+        // view; the UAV's own refresh ends with its view.
+        let list = host.new_list().expect("new_list");
+        let shadow = crate::shadow::find(base, 4).expect("shadow");
+        assert_eq!(root_view(&list, base, RootView::Srv), Some(shadow.gpu(base)));
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(shadow.read_u32(UAV_PAST), marker);
+        let view = root_uav_range(base).map(|(_, offset, len)| (offset, len));
+        assert_eq!(view, Some((0, ROOT_UAV_MAX)));
+
+        list.reset();
+        let heap = crate::descriptor::test_view_heap(16);
+        let mut state = State::default();
+        state.set_pipeline(pso);
+        state.set_heaps(&[heap]);
+        state.set_view(true, 0, base);
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        assert!(device_alive(host), "the device was removed");
+
+        // SAFETY: inside the committed allocation.
+        let title = |at: usize| unsafe { buf.ptr.add(at).cast::<u32>().read() };
+        assert_eq!(
+            title(UAV_INSIDE),
+            UAV_IN_RANGE,
+            "the in-range store must reach title memory, with 0 loaded past the view"
+        );
+        assert_eq!(title(UAV_PAST), marker, "title memory past the view changed");
+        assert_eq!(
+            shadow.read_u32(UAV_PAST),
+            marker,
+            "the store past the view landed in the host copy"
+        );
+
+        crate::shadow::unregister(buf.ptr as usize, base);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
+        assert_eq!(release(pso), 0);
+    }
+
+    /// A root UAV address not on 16 bytes of its copy cannot start a raw
+    /// view: it gets a null view, so the program's stores are dropped
+    /// without a fault. The same program at an address on 16 bytes stores.
+    #[test]
+    fn a_root_uav_off_16_bytes_gets_a_null_view() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !crate::pipeline::host::bounded_root_uavs() {
+            // As above: the program's far store needs a view with an end.
+            return;
+        }
+        let (shader, used) = build_root_uav_cs();
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+
+        let len = 3 << 20;
+        let buf = Allocation::watched(len);
+        let base = buf.addr();
+        crate::shadow::register(buf.ptr as usize, base, len as u64);
+        // SAFETY: inside the committed allocation.
+        let title = |at: usize| unsafe { buf.ptr.add(at).cast::<u32>().read() };
+        let shadow = crate::shadow::find(base, 4).expect("shadow");
+
+        // On 8 bytes: a root UAV descriptor takes it (4 are enough there).
+        assert!(root_uav_range(base + 8).is_none());
+        let list = host.new_list().expect("new_list");
+        assert!(root_view(&list, base + 8, RootView::Uav).is_some());
+        list.close();
+        host.execute(&[&list]);
+
+        list.reset();
+        let heap = crate::descriptor::test_view_heap(16);
+        let mut state = State::default();
+        state.set_pipeline(pso);
+        state.set_heaps(&[heap]);
+        state.set_view(true, 0, base + 8);
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        assert!(device_alive(host), "the device was removed");
+        for at in [8 + UAV_INSIDE, 8 + UAV_PAST] {
+            assert_eq!(title(at), 0, "a store through the null view reached title memory");
+            assert_eq!(shadow.read_u32(at), 0, "a store through the null view landed");
+        }
+
+        // On 16 bytes: the view starts there and the in-range store lands.
+        let range = root_uav_range(base + 16).map(|(_, offset, len)| (offset, len));
+        assert_eq!(range, Some((16, ROOT_UAV_MAX)));
+        list.reset();
+        state.reset(pso);
+        state.set_heaps(&[heap]);
+        state.set_view(true, 0, base + 16);
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        assert!(device_alive(host), "the device was removed");
+        assert_eq!(title(16 + UAV_INSIDE), UAV_IN_RANGE);
+        assert_eq!(title(16 + UAV_PAST), 0);
+        assert_eq!(shadow.read_u32(16 + UAV_PAST), 0);
+
+        crate::shadow::unregister(buf.ptr as usize, base);
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
         assert_eq!(release(pso), 0);
     }
