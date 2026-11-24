@@ -156,6 +156,7 @@ fn lower_cs(words: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -884,4 +885,549 @@ fn a_heap_index_past_the_heap_reads_the_guard_slot() {
         let want = if i == 0 { 7 } else { 0 };
         assert_eq!(got, want, "{label}: index {:#x}", k[0]);
     });
+}
+
+#[test]
+fn root_uav_validates_and_dispatches_on_gpu_and_warp() {
+    let s_load_dword = |dst: u8, base: u8, byte_off: u32| -> [u32; 2] {
+        [
+            0x3D << 26 | (dst as u32) << 6 | (base as u32 >> 1),
+            125 << 25 | (byte_off & 0x1F_FFFF),
+        ]
+    };
+    let buffer_load_dword = |vdst: u8, srsrc: u8, byte_off: u16| -> [u32; 2] {
+        [
+            0x38 << 26 | 0x0C << 18 | (byte_off as u32 & 0xFFF),
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdst as u32) << 8,
+        ]
+    };
+    let buffer_atomic_add_rtn = |vdata: u8, srsrc: u8, byte_off: u16| -> [u32; 2] {
+        [
+            0x38 << 26 | 0x32 << 18 | (1 << 14) | (byte_off as u32 & 0xFFF),
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+        ]
+    };
+    let global_store_dword = |vaddr: u8, vdata: u8, saddr: u8, byte_off: u16| -> [u32; 2] {
+        [
+            0x37 << 26 | 0x1C << 18 | (2 << 14) | (byte_off as u32 & 0xFFF),
+            (saddr as u32) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    };
+
+    let mut words = Vec::new();
+    // s[0:1] = Root CBV (slot 0), s[2:3] = Root SRV (slot 1), s[4:5] = Root UAV (slot 2).
+    words.extend_from_slice(&s_load_dword(6, 0, 8)); // s6 = cbv[2]
+    words.extend_from_slice(&s_load_dword(7, 2, 4)); // s7 = srv[1]
+    // Build a raw buffer descriptor around Root UAV s[4:5] in s[8:11].
+    words.push(s_mov_b32(8, 4));
+    words.push(s_mov_b32(9, 5));
+    words.push(s_mov_b32(10, 0xC1)); // -1
+    words.extend_from_slice(&[s_mov_b32(11, 0xFF), 0x3101_4FAC]);
+    // uav[0] = s6 via global_store_dword.
+    words.push(vop1(0x001, 0, 0x80)); // v0 = 0
+    words.push(vop1(0x001, 1, sgpr(6))); // v1 = s6
+    words.extend_from_slice(&global_store_dword(0, 1, 4, 0));
+    // uav[1] = s7 via buffer_store_dword, then atomic_add 17 (old value -> v3).
+    words.push(vop1(0x001, 2, sgpr(7))); // v2 = s7
+    words.extend_from_slice(&buffer_store_dword(2, 8, 4));
+    words.push(vop1(0x001, 3, 128 + 17)); // v3 = 17
+    words.extend_from_slice(&buffer_atomic_add_rtn(3, 8, 4));
+    // v4 = uav[0] via buffer_load_dword; uav[2] = v3 ^ v4.
+    words.extend_from_slice(&buffer_load_dword(4, 8, 0));
+    let vop2 = |op: u8, vdst: u8, src0: u16, vsrc1: u8| -> u32 {
+        (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+    };
+    words.push(vop2(0x1D, 5, vgpr(3), 4)); // v_xor_b32 v5, v3, v4
+    words.extend_from_slice(&buffer_store_dword(5, 8, 8));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 1,
+                user_data: 2,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 2,
+                user_data: 4,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 2,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 4,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 6 << 1,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let st = structure::structure(&p).expect("structure");
+    let container = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&container).expect("container");
+    let shader = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
+
+    assert_eq!(shader.root_cbvs, vec![0]);
+    assert_eq!(shader.root_srvs, vec![1]);
+    assert_eq!(shader.root_uavs, vec![2]);
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        // Root parameter 0 is user data; sorted root views follow at 1 (CBV 0), 2 (SRV 1), 3 (UAV 2).
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(vec![0; 4])),
+                        (
+                            1,
+                            Root::View {
+                                srv: false,
+                                data: vec![0x1111_1111, 0x2222_2222, 0xCAFE_BEEF, 0],
+                            },
+                        ),
+                        (
+                            2,
+                            Root::View {
+                                srv: true,
+                                data: vec![0, 0x1000, 0, 0],
+                            },
+                        ),
+                        (3, Root::Uav(4)),
+                    ],
+                    views: &[],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(
+            &out[0][..3],
+            &[0xCAFE_BEEF, 0x1011, 0x1000 ^ 0xCAFE_BEEF],
+            "{label}: unexpected Root UAV readback"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn root_uav_graphics_stages_validate_and_build_pso() {
+    use super::bitcode::{Attr, Term};
+    use super::container::SigElement;
+    use super::shader::Shader;
+
+    let make_stage = |pixel: bool, slots: &[u8]| -> HostShader {
+        let mut s = Shader::new(pixel);
+        let b = s.entry;
+        let iu = s.m.undef(s.t.i32);
+        for (k, &slot) in slots.iter().enumerate() {
+            let h = s.root_uav_handle(slot);
+            let args = [
+                h,
+                s.m.i32((k * 4) as u32),
+                iu,
+                s.m.i32(0x1234_0000 + u32::from(slot)),
+                iu,
+                iu,
+                iu,
+                s.m.i8(1),
+                s.m.i32(4),
+            ];
+            s.op(
+                b,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                s.t.void,
+                140,
+                &args,
+            );
+        }
+        let out = SigElement {
+            name: if pixel { "SV_Target" } else { "SV_Position" }.into(),
+            index: 0,
+            kind: if pixel { 16 } else { 3 },
+            comp: 9,
+            interp: if pixel { 0 } else { 4 },
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        for col in 0..4u8 {
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.f32(0)];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        s.outputs.push(out);
+        if pixel {
+            s.inputs.push(SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 4,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            });
+        }
+        s.m.terminate(b, Term::Ret);
+        HostShader {
+            stage: if pixel { HwStage::Ps } else { HwStage::Vs },
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: slots.to_vec(),
+        }
+    };
+
+    let vs = make_stage(false, &[2]);
+    let ps = make_stage(true, &[2, 3]);
+
+    // Vertex shaders writing UAVs must stamp SFI0 UAVsAtEveryStage (0x4).
+    let vs_c = crate::Container::parse(&vs.dxil).unwrap();
+    let sfi0 = u64::from_le_bytes(
+        vs_c.part(crate::FourCC::SFI0)
+            .unwrap()
+            .data
+            .try_into()
+            .unwrap(),
+    );
+    assert_ne!(
+        sfi0 & 0x4,
+        0,
+        "VS with Root UAV must set SFI0 UAVsAtEveryStage"
+    );
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for (name, sh) in [("vs", &vs), ("ps", &ps)] {
+            let mut copy = sh.dxil.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy)
+                .unwrap_or_else(|e| panic!("{name}: DXIL validation failed: {e}"));
+            assert_eq!(copy[4..20], ours[..], "{name}: container hash mismatch");
+        }
+    }
+
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        host.pipeline(&vs, &ps).unwrap_or_else(|e| {
+            panic!("{label}: graphics pipeline with shared Root UAV failed: {e}")
+        });
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+// Root arguments in the spill table (`s[0:1]`), with a root UAV among them.
+
+fn spilled_cs(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    rsrc2: u32,
+    spill: Option<bool>,
+) -> Result<HostShader, String> {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    // The condition `emit::translate` uses, unless the test overrides it.
+    let spilled = spill.unwrap_or(native.spilled());
+    let p = ir::build_with(&native.code, native.wave64, native.vgprs, spilled)
+        .map_err(|e| format!("ir: {e:?}"))?;
+    let res = resource::track(&p, &native.layout, native.stage)
+        .map_err(|e| format!("resources: {e:?}"))?;
+    let io = io::raise(&p, &native).map_err(|e| format!("io: {e:?}"))?;
+    let st = structure::structure(&p).map_err(|e| format!("structure: {e:?}"))?;
+    let container = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&container).expect("container");
+    let shader =
+        super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).map_err(|e| format!("emit: {e:?}"))?;
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy)
+            .map_err(|e| format!("validation: {e}"))?;
+    }
+    Ok(shader)
+}
+
+fn spilled_desc(user_data: u8, slot: u8) -> RootParam {
+    RootParam {
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        sgprs: 2,
+        base_register: u32::from(slot),
+        user_data,
+        slot,
+    }
+}
+
+fn spilled_uav(user_data: u8, slot: u8) -> UsedResource {
+    UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 2,
+        user_data,
+        slot,
+    }
+}
+
+const fn spilled_s_load(n: u32, dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | n << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | (byte_off & 0x1F_FFFF),
+    ]
+}
+
+/// The kind of program reported for 3b90165a77d95cdf: every root argument
+/// past the 16 user SGPRs, a 16-dword table load into s[8:23], then the root
+/// UAV address loaded from table dwords 2..3, a descriptor built around it
+/// and a buffer store.
+fn spilled_program() -> Vec<u32> {
+    let mut words = Vec::new();
+    words.push(s_mov_b32(2, 0)); // s2 = s0
+    words.extend_from_slice(&[0x8703_FF01, 0x0000_00FF]); // s3 = s1 & 0xff
+    words.extend_from_slice(&spilled_s_load(4, 8, 2, 0x10)); // s[8:23] = table dwords 4..19
+    words.extend_from_slice(&spilled_s_load(1, 4, 2, 0x8)); // s[4:5] = table dwords 2..3
+    words.push(s_mov_b32(24, 4));
+    words.push(s_mov_b32(25, 5));
+    words.push(s_mov_b32(26, 0xC1)); // -1
+    words.extend_from_slice(&[s_mov_b32(27, 0xFF), 0x3101_4FAC]);
+    words.push(vop1(0x001, 0, sgpr(8))); // v0 = table dword 4 (user data 20)
+    words.extend_from_slice(&buffer_store_dword(0, 24, 0));
+    words.push(vop1(0x001, 1, sgpr(23))); // v1 = table dword 19 (user data 35)
+    words.extend_from_slice(&buffer_store_dword(1, 24, 4));
+    words.push(S_ENDPGM);
+    words
+}
+
+fn spilled_layout() -> (Vec<RootParam>, Vec<UsedResource>) {
+    (
+        vec![
+            spilled_desc(16, 0),
+            spilled_desc(18, 1),
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 16,
+                base_register: 0,
+                user_data: 20,
+                slot: 2,
+            },
+        ],
+        vec![spilled_uav(18, 1)],
+    )
+}
+
+#[test]
+fn a_spilled_root_uav_program_translates_and_runs() {
+    let (layout, used) = spilled_layout();
+    // Without the spill rule: the refusal the testers report.
+    let plain = spilled_cs(
+        &spilled_program(),
+        layout.clone(),
+        used.clone(),
+        4 << 1,
+        Some(false),
+    );
+    assert!(plain.is_err());
+    let shader = spilled_cs(&spilled_program(), layout, used, 4 << 1, None)
+        .unwrap_or_else(|e| panic!("with spill rule: {e}"));
+    eprintln!(
+        "user_data {:?} cbvs {:?} srvs {:?} uavs {:?} dwords {}",
+        shader
+            .user_data
+            .iter()
+            .map(|u| (u.index, u.slot, u.dword))
+            .collect::<Vec<_>>(),
+        shader.root_cbvs,
+        shader.root_srvs,
+        shader.root_uavs,
+        shader.user_data_dwords()
+    );
+    assert_eq!(shader.root_uavs, vec![1]);
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let constants: Vec<u32> = (0..shader.user_data_dwords()).map(|i| 100 + i).collect();
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(constants)), (1, Root::Uav(4))],
+                    views: &[],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        eprintln!("{label}: root UAV readback {:?}", &out[0][..4]);
+        assert_eq!(&out[0][..2], &[120, 135], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
+/// 16 user SGPRs and the group id enabled: GroupId.x is in s16, the SGPR
+/// the spill rule also uses for table dword 0. Such a program is left alone.
+#[test]
+fn a_group_id_in_s16_keeps_the_spill_rule_off() {
+    let mut words = Vec::new();
+    words.push(s_mov_b32(2, 0));
+    words.extend_from_slice(&[0x8703_FF01, 0x0000_00FF]);
+    words.extend_from_slice(&spilled_s_load(0, 6, 2, 0x0)); // s6 = table dword 0 (user data 16)
+    words.extend_from_slice(&spilled_s_load(1, 4, 2, 0x8)); // s[4:5] = table dwords 2..3
+    words.push(s_mov_b32(24, 4));
+    words.push(s_mov_b32(25, 5));
+    words.push(s_mov_b32(26, 0xC1));
+    words.extend_from_slice(&[s_mov_b32(27, 0xFF), 0x3101_4FAC]);
+    words.push(vop1(0x001, 0, sgpr(6))); // v0 = the root constant
+    words.extend_from_slice(&buffer_store_dword(0, 24, 0));
+    words.push(vop1(0x001, 1, sgpr(16))); // v1 = s16: GroupId.x on the console
+    words.extend_from_slice(&buffer_store_dword(1, 24, 4));
+    words.push(S_ENDPGM);
+    let layout = vec![
+        RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 16,
+            slot: 0,
+        },
+        spilled_desc(18, 1),
+    ];
+    // Left alone: the program stops as it did before the spill rule.
+    let refused = spilled_cs(
+        &words,
+        layout.clone(),
+        vec![spilled_uav(18, 1)],
+        16 << 1 | 1 << 7,
+        None,
+    );
+    assert!(refused.is_err(), "the rule must not apply with GroupId.x in s16");
+    // With the rule forced, the root constant shows where the console has
+    // the group id: what the guard avoids.
+    let shader = spilled_cs(
+        &words,
+        layout,
+        vec![spilled_uav(18, 1)],
+        16 << 1 | 1 << 7,
+        Some(true),
+    )
+    .unwrap_or_else(|e| panic!("forced spill rule: {e}"));
+    let Ok(host) = Host::new(false) else {
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    let constants: Vec<u32> = (0..shader.user_data_dwords()).map(|i| 100 + i).collect();
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(constants)), (1, Root::Uav(4))],
+                views: &[],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap();
+    // The console: [116 (root constant), 0 (group 0)].
+    assert_eq!(&out[0][..2], &[116, 116]);
 }

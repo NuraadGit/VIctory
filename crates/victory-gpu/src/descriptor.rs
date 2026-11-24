@@ -668,6 +668,30 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+/// A shader-visible view heap of `count` descriptors, for tests that bind
+/// tables.
+#[cfg(test)]
+pub(crate) fn test_view_heap(count: u32) -> This {
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let extended = Extended(
+        HeapDesc {
+            kind: VIEWS_KIND,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        },
+        Placement {
+            address: 0,
+            size: 0,
+        },
+    );
+    let mut heap = std::ptr::null();
+    let hr = create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut heap);
+    assert_eq!(hr, crate::object::S_OK);
+    heap
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
