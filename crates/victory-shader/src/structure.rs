@@ -102,6 +102,8 @@ const MAX_NODES: usize = 1 << 21;
 /// Cap the `ite` memo table so complex shaders cannot trigger multi-tens-of-MB
 /// HashMap resizes (e.g. 35 MB at 2^21 buckets) under concurrent compilation.
 const MAX_MEMO: usize = 1 << 18;
+/// Case splits [`Bools::meet`] makes before it gives up.
+const MAX_MEET: usize = 1 << 16;
 
 impl Bools {
     fn new() -> Self {
@@ -232,6 +234,38 @@ impl Bools {
         self.ite(a, nb, b)
     }
 
+    /// Whether some lane can satisfy every `(b, holds)` of `all` at once:
+    /// `b` where `holds`, its negation where not. Yes when the search grows
+    /// too large to finish.
+    pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
+        let mut budget = MAX_MEET;
+        self.meet_in(all.to_vec(), &mut budget)
+    }
+
+    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
+        if all.iter().any(fails) {
+            return false;
+        }
+        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        if all.is_empty() || *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        let top = |b: Bool| self.nodes[b.0 as usize].0;
+        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
+        [false, true].into_iter().any(|value| {
+            let next = all
+                .iter()
+                .map(|&(b, holds)| {
+                    let (lo, hi) = self.split(b, v);
+                    (if value { hi } else { lo }, holds)
+                })
+                .collect();
+            self.meet_in(next, budget)
+        })
+    }
+
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
@@ -320,8 +354,13 @@ pub struct Structured {
     /// enough (lanes outside EXEC then never get there, so a VGPR write
     /// needs no old value). Always `None` for scalar instructions.
     pub guards: Vec<Vec<Option<Bool>>>,
+    /// Per block: what holds in every lane that enters it (over forward
+    /// edges; a loop header forgets what its loop redefines).
+    pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Exact Wave64 pairs for checking masks at their uses.
+    paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -345,6 +384,16 @@ pub struct Structured {
     pub pairs: HashMap<Value, Value>,
 }
 
+impl Structured {
+    pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
+        match high {
+            Some(high) => self.paired_masks.get(&(low, high)),
+            None => self.masks.get(&low),
+        }
+        .copied()
+    }
+}
+
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     run(Lanes::new(program, false)?)
@@ -363,6 +412,9 @@ pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
 fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
     loop {
         let execs = l.masks_in_order();
+        while let Some(key) = l.console_pending.pop() {
+            l.mask(key);
+        }
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
@@ -381,6 +433,7 @@ struct Lanes<'a> {
     p: &'a Program,
     /// See [`structure_console`].
     console: bool,
+    console_pending: Vec<Key>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -458,6 +511,7 @@ impl<'a> Lanes<'a> {
         Ok(Lanes {
             p,
             console,
+            console_pending: Vec::new(),
             order,
             index,
             incoming,
@@ -641,6 +695,9 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .copied()
                 .collect(),
+            reach: cond.to_vec(),
+            // Last: it takes the masks the fields above read.
+            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
         })
     }
 
@@ -769,6 +826,9 @@ impl<'a> Lanes<'a> {
                     return Some((m, derived));
                 }
             }
+        }
+        if self.console {
+            self.console_pending.extend(args);
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))

@@ -337,9 +337,10 @@ mod tests {
         if fwd {
             forward(&mut p);
         }
-        let res = resource::track(&p, &native.layout, native.stage)?;
+        let st = structure::structure(&p);
+        let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
         let io = io::raise(&p, &native)?;
-        let st = structure::structure(&p)?;
+        let st = st?;
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
         crate::emit::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).map(|_| ())
@@ -364,9 +365,10 @@ mod tests {
         if fwd {
             forward(&mut p);
         }
-        let res = resource::track(&p, &native.layout, native.stage)?;
+        let st = structure::structure(&p);
+        let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
         let io = io::raise(&p, &native)?;
-        let st = structure::structure(&p)?;
+        let st = st?;
         crate::emit::lower_compute(&native, &p, &st, &io, &res, per_lane_only)
     }
 

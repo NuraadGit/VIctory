@@ -13,10 +13,13 @@ turned down upstream.
 - Before inclusion, every PR was built and tested on one Windows 11
   machine (NVIDIA RTX 5070, 32-lane waves only; WARP). The title was not
   used in these tests: the integration machine has not run this tree with
-  the title. **Nobody has run this tree with the title yet.** It makes no
-  claim about results in the title.
+  the title. One tester has run an earlier head of it with the title (see
+  "Reports from the title"); nobody has reported a run of this head. It
+  makes no claim about results in the title.
 - Update 3 adds #493, #483, #206, #469, #459, #454 and #579, and brings
-  the wave64 stack up to #439's head `d2189ff`.
+  the wave64 stack up to #439's head `e4d899f`.
+- Update 4 adds #566 (with the rest of #307) and brings the wave64 stack
+  to #439's head `055aef9`.
 
 ## Reports from the title
 
@@ -31,6 +34,17 @@ with other builds than this tree. They were not repeated here.
   in the world) and an RTX 3070 (Vyral1978, about 14 minutes in the
   world). The 3D scene was black in all of them. Upstream issue #71,
   comments 7123097017, 7123060678 and 7123087811.
+- **First run of this tree with the title** (nullmarsh, upstream issue
+  #293, comment 7125407618; tree at `7670a8a`, before updates 3 and 4;
+  AMD RX 9060 XT, opening cutscene, compared with `d2a4bae` + #135 +
+  #365): the device was lost 251 and 153 s into the world against 40 to
+  94 s on the comparison build, each time `0x887A0006`; 178 unique
+  refused programs against 372 to 387; 1,292 draws dropped per frame
+  against 968 to 1,183. The largest rows per frame: `an address in an
+  SGPR that is no root parameter` 891, `a descriptor read from the first
+  lane of a phi` 306 (the reason #566 handles, new in update 4), `a
+  structured buffer of unknown stride` 226. World frames were black
+  apart from the opening-credit text.
 - **How this tree differs from that set.** It has all of those PRs but
   #189. In #189's place it carries the wave64 stack (#223, #233, #320,
   #439, #180), which cannot be in one tree with #189, and it has the
@@ -159,9 +173,15 @@ and the name is its author's GitHub login.
 
 ### Shaders: descriptor tracking, signatures and validator fixes
 
-- #307 (AntoninMichelq): waterfall loops over per-lane descriptors, and
-  descriptors chosen by `s_cselect` (with a one-file fix to
-  `apps/victory/src/translate.rs` so the CLI builds)
+- #307 (AntoninMichelq), head `6285e19`: waterfall loops over per-lane
+  descriptors, and descriptors chosen by `s_cselect`. Its last two
+  commits (`077ec8b`, `6285e19`) came in with #566.
+- #566 (r4tedx), head `6c63dea`: per-lane descriptors chosen by control
+  flow (an if/else whose arms each set the descriptor, traced on the
+  paths the accessing lanes take), and a waterfall loop is proven on the
+  lane masks before the first lane's descriptor is taken as each lane's
+  own; each failed proof has its own reason. Its commit `b1c8306` (the
+  proof) is by fuzeofficlal. Stacked on #307.
 - #309 (AntoninMichelq): SGPRs reloaded from VGPR lanes are read as the
   spilled value
 - #306 (wbkepler): DXIL validator failures (signatures, PSV0,
@@ -205,7 +225,7 @@ and the name is its author's GitHub login.
   console flow on hosts without 64-lane waves
 - #320 (r4tedx): lane reads and writes where lanes branch differently
   run in the console flow, on every host
-- #439 (r4tedx), head `d2189ff`: one console wave sharing LDS runs in
+- #439 (r4tedx), head `055aef9`: one console wave sharing LDS runs in
   the console flow. It carries peter-bonanni's commit `9b73d66`
   ("carry whole-wave integer scans across two 32-lane waves"):
   whole-wave sections across the two halves. It also carries `416714c`
@@ -224,8 +244,18 @@ and also on an AMD Radeon integrated GPU (64-lane waves). #439's five
 commits after `e49302a` (`a32c177`, `8876ed3`, `416714c`, `f653ea4`,
 `965ce30`) were picked onto the tree in update 3, in two merge commits,
 and its docs-only commit `2467891` and test-only commit `e6936e3` after them,
-then `d2189ff` (compute selects take masks held as numbers),
-and the shader tests ran again on both GPUs.
+then `d2189ff` (compute selects take masks held as numbers), `9e98b2b`
+(by ifBars, from pull request r4tedx/VIctory#6: the inputs of console
+mask joins carried around a loop are resolved after the first walk) and
+`901eef9` (its test runs on every hardware adapter), then `e4d899f` (a
+mask copied dword by dword in the console flow stops with `an opaque
+lane mask` where the translator overflowed its stack; a lane read
+beside a whole-wave section takes the console flow),
+and the shader tests ran again on both GPUs. Its `055aef9` (a numeric
+select nothing consumes no longer asks for the console's wave size) is
+in this tree as MichaelSmithAI's original commit `3d3f32e`, merged from
+pull request r4tedx/VIctory#5; after that merge the tests ran on the RTX
+5070 only.
 
 **Validation failures, fixed by #180.** A whole-title
 `translate --validate` run found #320 adds 20 compute modules that fail
@@ -253,6 +283,18 @@ machines with newer drivers did not show it.
   it, `cargo test` sometimes never finishes, with several GPU tests stuck
   together. On the integration machine, before #433, 4 of 12 runs of the
   shader tests hung; with it, 0 of 12 did.
+- **Still not stable at update 4.** `cargo test --workspace
+  --no-fail-fast` passed at the #566 merge (430 passed, 5 ignored). With
+  r4tedx/VIctory#5 on top, 14 runs of the shader tests on the RTX 5070,
+  while other GPU work ran on the same PC: 11 passed (200 tests), one
+  ended with no test named, one never finished (16 image and wave64
+  split tests stuck together), and in one the driver removed the device
+  under 13 image and split tests that were running (`The GPU device
+  instance has been suspended`; the NVIDIA driver logged `Error occurred
+  on GPUID` at that second). The tests in flight were already in this
+  tree before update 4, and none of #566's was among them; which test
+  or what else on the PC set it off is not known. The runs were stopped
+  there. These are test programs, not the title.
 
 ### Switches that are off unless set
 
@@ -369,6 +411,40 @@ is described in its merge or fix commit.
 - **#439's new commits with #180:** in `Lower::new`, the instructions
   that read lanes of the same half are #180's implicit-derivative
   samples and `416714c`'s `ds_bpermute_b32`, both.
+- **#439's `e4d899f` with #309 and the mask-SCC change:** its test for a
+  lane read or write outside a whole-wave section looks at live
+  instructions only, as this tree's earlier test did (dead SGPR-spill
+  lane instructions do not send a program to the console flow). In
+  `Lower`, its `opaque_open` and the tree's `mask_scc` are both kept.
+
+- **Merge base of #566:** the tree held #307 as its first two commits
+  (`5ca7d9a`, `52637df`, the same files as `ffa6635`), so git took
+  upstream `main` as the base. Each file was merged with `ffa6635` as
+  the base instead.
+- **#566 with the wave64 stack (`structure.rs`):** `Structured` keeps the
+  stack's `execs`, `others` and `pairs` and #566's `reach` and
+  `paired_masks`. `pairs` (one high dword per low, no lane bits) and
+  `paired_masks` (the lane bit of each exact pair) are not the same
+  information and stay separate.
+- **#566 with #483 (per-lane heap indices):** the index joined over the
+  edges is made of indices that already went through #483's guard;
+  #566's GPU tests fill the guard dwords.
+- **Mechanical fixes for #566's `resource::track` argument:** every
+  caller passes the per-lane form (`emit/mod.rs`, `emit/lower.rs`,
+  `emit/image_tests.rs`, `emit/lane_read_loop_tests.rs`,
+  `sgpr_spill.rs`, and the test of r4tedx/VIctory#5); #566's GPU test
+  fills #233's and #320's fields of `lower::Parts`.
+- **#566 with the console flow (#233, #320, #439)** (commit `Shaders:
+  the console flow refuses per-lane descriptors chosen by control
+  flow`): in the console flow every lane reaches a join by the wave's
+  edge, so #566's phi gave every lane one descriptor (measured: all 32
+  lanes the second texture). The console flow refuses such a program by
+  name and it keeps the per-lane form. New test:
+  `joined_descriptors_keep_the_per_lane_form_when_the_console_flow_is_asked_for`.
+- **#566's GPU tests run one at a time** (commit `Tests: #566's GPU
+  tests run one at a time`): in parallel the test binary sometimes died
+  of an access violation (7 of 24 runs); with a lock, as #433's, 0 of 36
+  runs of those tests alone.
 
 ## Left out on purpose
 

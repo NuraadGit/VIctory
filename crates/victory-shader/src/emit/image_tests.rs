@@ -227,9 +227,10 @@ fn translate(inst: Mimg, literals: &[(u8, u32)]) -> Result<HostShader, ShaderErr
 fn lower(words: &[u32]) -> Result<HostShader, ShaderError> {
     let n = native(words);
     let p = ir::build(&n.code, n.wave64, n.vgprs)?;
-    let res = resource::track(&p, &n.layout, n.stage)?;
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &n.layout, n.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &n)?;
-    let st = structure::structure(&p)?;
+    let st = st?;
     let bytes = dxbc::build(&[]);
     let c = Container::parse(&bytes)?;
     emit(&c, &n, &p, &st, &io, &res, super::Target::ANY)

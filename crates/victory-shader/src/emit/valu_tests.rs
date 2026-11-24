@@ -129,9 +129,10 @@ fn lower_cs(words: &[u32]) -> HostShader {
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -1012,9 +1013,10 @@ fn root_uav_validates_and_dispatches_on_gpu_and_warp() {
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
     let container = crate::dxbc::build(&[]);
     let c = crate::Container::parse(&container).expect("container");
     let shader = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
@@ -1221,10 +1223,13 @@ fn spilled_cs(
     let spilled = spill.unwrap_or(native.spilled());
     let p = ir::build_with(&native.code, native.wave64, native.vgprs, spilled)
         .map_err(|e| format!("ir: {e:?}"))?;
-    let res = resource::track(&p, &native.layout, native.stage)
+    // The order `emit::translate` has: a program that cannot be structured
+    // is still traced, and fails where it failed before.
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())
         .map_err(|e| format!("resources: {e:?}"))?;
     let io = io::raise(&p, &native).map_err(|e| format!("io: {e:?}"))?;
-    let st = structure::structure(&p).map_err(|e| format!("structure: {e:?}"))?;
+    let st = st.map_err(|e| format!("structure: {e:?}"))?;
     let container = crate::dxbc::build(&[]);
     let c = crate::Container::parse(&container).expect("container");
     let shader =
