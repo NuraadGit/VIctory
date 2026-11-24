@@ -317,6 +317,36 @@ fn divergent_cross_half_ballot_is_rejected_instead_of_hanging() {
 }
 
 #[test]
+fn divergent_readfirstlane_reads_its_halfs_first_lane_on_wave32() {
+    // if (v0 < 32) { s4 = readfirstlane(v0); v1 = s4; } else { v1 = 0; } store(v1)
+    // The halves cannot meet at a barrier inside the branch; on Wave32 each
+    // reads its own first active lane (no barrier, so no hang), Emulate still
+    // refuses.
+    let mut code = Vec::new();
+    code.push(v_mov_b32(1, inline_u(0)));
+    code.push(v_cmp_gt_u32(inline_u(32), 0)); // 32 > v0
+    code.push(s_and_saveexec_b64(6, VCC)); // s[6:7]
+    let br_idx = code.len();
+    code.push(0); // placeholder for s_cbranch_execz -> after_then
+    code.push(v_readfirstlane_b32(4, 0));
+    code.push(v_mov_b32(1, 4));
+    let after_then = code.len();
+    code[br_idx] = s_cbranch_execz((after_then - (br_idx + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    emit_uav_store(&mut code, 1, 0);
+    code.push(S_ENDPGM);
+
+    let prog = make_cs_program(&code, [128, 1, 1], 0, false);
+    assert!(emit_cs(&prog, Wave64Mode::Native).is_ok());
+    let wave32 = emit_cs(&prog, Wave64Mode::Wave32).unwrap();
+    assert_eq!(psv_wave_range(&wave32), (32, 32));
+    assert!(matches!(
+        emit_cs(&prog, Wave64Mode::Emulate),
+        Err(ShaderError::Unsupported { .. })
+    ));
+}
+
+#[test]
 fn divergent_early_return_taints_subsequent_blocks() {
     // if (v0 < 32) return; // after_ret is non-uniform across the group!
     // bcnt1 in after_ret must fail instead of inserting a hanging barrier.

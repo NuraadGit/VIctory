@@ -1319,14 +1319,14 @@ impl<'a> Lower<'a> {
 
     /// Emulates `v_readfirstlane_b32(val)` across all 64 lanes of a virtual wave.
     fn emulated_readfirstlane(&mut self, val: V, guard: Option<V>) -> Result<V, Why> {
-        if self.guard_depth > 0 || !self.uniform.get(self.cur_ir).copied().unwrap_or(false) {
+        let divergent =
+            self.guard_depth > 0 || !self.uniform.get(self.cur_ir).copied().unwrap_or(false);
+        if divergent && self.wave64 != Wave64Mode::Wave32 {
             return Err("v_readfirstlane in divergent control flow");
         }
-        let (_, console_lane, vwave) = self.ensure_wave_ids();
-        let stride = self.ballot_stride;
-        let base = self.ballot_base;
         let act = guard.unwrap_or_else(|| self.s.m.bool(true));
         if self.wave64 == Wave64Mode::Wave32 {
+            // The first active lane of this host wave (half the virtual wave).
             let c = self.cur;
             let i32t = self.s.t.i32;
             let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -1342,6 +1342,17 @@ impl<'a> Lower<'a> {
                 .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[mask]);
             let safe_idx = self.s.m.select(c, any, bit, k0);
             let picked = self.read_lane(val, safe_idx);
+            if divergent {
+                // shortcut: in divergent control flow the halves cannot meet at a
+                // barrier, so each half reads its own first active lane. Exact for
+                // a value uniform over the active lanes (what readfirstlane is
+                // mostly for); a waterfall loop over a varying value still visits
+                // every value, half by half.
+                return Ok(picked);
+            }
+            let (_, console_lane, vwave) = self.ensure_wave_ids();
+            let stride = self.ballot_stride;
+            let base = self.ballot_base;
 
             self.lds_barrier(self.cur);
             let k0 = self.s.m.i32(0);
@@ -1384,6 +1395,9 @@ impl<'a> Lower<'a> {
         }
 
         // Emulate mode: find lowest active console lane via atomicMin.
+        let (_, console_lane, vwave) = self.ensure_wave_ids();
+        let stride = self.ballot_stride;
+        let base = self.ballot_base;
         self.lds_barrier(self.cur);
         let k0 = self.s.m.i32(0);
         let kmax = self.s.m.i32(u32::MAX);
