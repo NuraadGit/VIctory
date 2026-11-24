@@ -2066,6 +2066,110 @@ mod tests {
         (shader, used)
     }
 
+    /// Byte offsets from the root SRV's address that [`build_root_srv_cs`]'s
+    /// program loads: under 1 MiB, and at `+1.5 MiB`.
+    const SRV_NEAR: usize = 0x8_0000;
+    const SRV_FAR: usize = 0x18_0000;
+    /// Byte offsets from its root UAV's address where it stores the two.
+    const SRV_NEAR_OUT: usize = 16;
+    const SRV_FAR_OUT: usize = 32;
+
+    /// Synthetic GFX10 compute shader with a root SRV (slot 0) and a root
+    /// UAV (slot 1). It stores the SRV's dwords at [`SRV_NEAR`] and
+    /// [`SRV_FAR`] at [`SRV_NEAR_OUT`] and [`SRV_FAR_OUT`] of the UAV,
+    /// unchanged.
+    fn build_root_srv_cs() -> (victory_shader::emit::HostShader, Vec<UsedResource>) {
+        let s_mov_b32 =
+            |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32;
+        let v_mov_b32 =
+            |vdst: u8, value: u32| [0x7E00_0000 | (vdst as u32) << 17 | 0x001 << 9 | 0xFF, value];
+        let buffer_load_dword_offen = |vdst: u8, vaddr: u8, srsrc: u8| -> [u32; 2] {
+            [
+                0x38 << 26 | 0x0C << 18 | (1 << 12),
+                0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdst as u32) << 8 | vaddr as u32,
+            ]
+        };
+        let buffer_store_dword_offen = |vdata: u8, vaddr: u8, srsrc: u8| -> [u32; 2] {
+            [
+                0x38 << 26 | 0x1C << 18 | (1 << 12),
+                0x80 << 24
+                    | ((srsrc as u32 >> 2) & 0x1F) << 16
+                    | (vdata as u32) << 8
+                    | vaddr as u32,
+            ]
+        };
+
+        let mut words = Vec::new();
+        // s[0:1] = SRV 0, s[2:3] = UAV 1; their descriptors in s[8:11] and
+        // s[12:15].
+        words.push(s_mov_b32(8, 0));
+        words.push(s_mov_b32(9, 1));
+        words.push(s_mov_b32(10, 0xC1));
+        words.extend_from_slice(&[s_mov_b32(11, 0xFF), 0x3101_4FAC]);
+        words.push(s_mov_b32(12, 2));
+        words.push(s_mov_b32(13, 3));
+        words.push(s_mov_b32(14, 0xC1));
+        words.extend_from_slice(&[s_mov_b32(15, 0xFF), 0x3101_4FAC]);
+        // uav[SRV_NEAR_OUT] = srv[SRV_NEAR]; uav[SRV_FAR_OUT] = srv[SRV_FAR].
+        for (n, (from, to)) in [(SRV_NEAR, SRV_NEAR_OUT), (SRV_FAR, SRV_FAR_OUT)]
+            .into_iter()
+            .enumerate()
+        {
+            let v = 3 * n as u8;
+            words.extend_from_slice(&v_mov_b32(v, from as u32));
+            words.extend_from_slice(&buffer_load_dword_offen(v + 1, v, 8));
+            words.extend_from_slice(&v_mov_b32(v + 2, to as u32));
+            words.extend_from_slice(&buffer_store_dword_offen(v + 1, v + 2, 12));
+        }
+        words.push(0xBF81_0000); // s_endpgm
+
+        let view = |kind, slot: u8| UsedResource {
+            kind,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 2 * slot,
+            slot,
+        };
+        let used = vec![view(ResourceType::Srv, 0), view(ResourceType::Uav, 1)];
+        let param = |slot: u8| RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: u32::from(slot),
+            user_data: 2 * slot,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![param(0), param(1)],
+            used: used.clone(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 4 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = victory_shader::ir::build(&native.code, false, 8).unwrap();
+        let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let target = victory_shader::emit::Target::ANY;
+        let shader = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res, target).unwrap();
+        assert_eq!(shader.root_srvs, vec![0]);
+        assert_eq!(shader.root_uavs, vec![1]);
+        (shader, used)
+    }
+
     /// Whether the host's device is still there.
     fn device_alive(host: &crate::host::Host) -> bool {
         // SAFETY: a live device.
@@ -2272,6 +2376,75 @@ mod tests {
         crate::shadow::unregister(srv_buf.ptr as usize, srv_buf.addr());
         crate::shadow::unregister(uav_buf.ptr as usize, uav_buf.addr());
         crate::shadow::unregister(cbv_buf.ptr as usize, cbv_buf.addr());
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
+        assert_eq!(release(pso), 0);
+    }
+
+    /// A root SRV bound as a one-view table has its copy refreshed as far
+    /// as [`root_len`] says, not only over its first 1 MiB: a program that
+    /// loads the dword 1.5 MiB into the buffer gets what title memory holds
+    /// there. With the refresh cut to 1 MiB the page is never copied and
+    /// the load reads 0 (the view itself reaches the copy's end either
+    /// way), while the load under 1 MiB still reads its dword.
+    ///
+    /// Only the table's own bind refreshes the SRV's copy here: the output
+    /// is a root UAV on a buffer of its own, and nothing else is bound.
+    #[test]
+    fn a_root_srv_table_refreshes_its_copy_past_one_mib() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !crate::pipeline::host::bounded_root_srvs() || root_srv_cap() < 2 << 20 {
+            // A root descriptor is another path ([`root_view`]), and a cap
+            // set under the offset read is the case this test tells apart.
+            return;
+        }
+        let (shader, used) = build_root_srv_cs();
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+
+        let len = 2 << 20;
+        let srv_buf = Allocation::watched(len);
+        let out_buf = Allocation::watched(64 << 10);
+        crate::shadow::register(srv_buf.ptr as usize, srv_buf.addr(), len as u64);
+        crate::shadow::register(out_buf.ptr as usize, out_buf.addr(), 64 << 10);
+        let (near, far, unwritten) = (0x0000_BEA7u32, 0xFACE_0FF5u32, 0xFFFF_FFFFu32);
+        // SAFETY: inside the committed allocations.
+        unsafe {
+            srv_buf.ptr.add(SRV_NEAR).cast::<u32>().write(near);
+            srv_buf.ptr.add(SRV_FAR).cast::<u32>().write(far);
+            out_buf.ptr.add(SRV_NEAR_OUT).cast::<u32>().write(unwritten);
+            out_buf.ptr.add(SRV_FAR_OUT).cast::<u32>().write(unwritten);
+        }
+        // The copy holds nothing of the buffer before the bind.
+        let shadow = crate::shadow::find(srv_buf.addr(), 4).expect("shadow");
+        assert_eq!(shadow.read_u32(SRV_NEAR), 0);
+        assert_eq!(shadow.read_u32(SRV_FAR), 0);
+
+        let list = host.new_list().expect("new_list");
+        let heap = crate::descriptor::test_view_heap(16);
+        let mut state = State::default();
+        state.set_pipeline(pso);
+        state.set_heaps(&[heap]);
+        state.set_view(true, 0, srv_buf.addr());
+        state.set_view(true, 1, out_buf.addr());
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        assert!(device_alive(host), "the device was removed");
+
+        // SAFETY: inside the committed allocation.
+        let out = |at: usize| unsafe { out_buf.ptr.add(at).cast::<u32>().read() };
+        let (got_near, got_far) = (out(SRV_NEAR_OUT), out(SRV_FAR_OUT));
+        eprintln!("root SRV table: read {got_near:#x} at +0.5 MiB, {got_far:#x} at +1.5 MiB");
+        assert_eq!(got_near, near, "the load under 1 MiB");
+        assert_eq!(
+            got_far, far,
+            "the load at +1.5 MiB (0: the page was not refreshed)"
+        );
+        assert_eq!(shadow.read_u32(SRV_FAR), far);
+
+        crate::shadow::unregister(srv_buf.ptr as usize, srv_buf.addr());
+        crate::shadow::unregister(out_buf.ptr as usize, out_buf.addr());
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
         assert_eq!(release(pso), 0);
     }
