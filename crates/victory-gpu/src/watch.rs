@@ -303,12 +303,16 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // The journal is keyed by address and outlives a freed allocation:
+        // memory a test beside this one freed may have been here, so pages
+        // may be listed already, but none as written at this asking.
+        let (first, before) = writes(start, end, false).expect("watched");
+        assert!(before.iter().all(|&(_, asked)| asked < first));
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        let fresh: Vec<_> = after.into_iter().filter(|&(_, w)| w >= first).collect();
+        assert_eq!(fresh, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);

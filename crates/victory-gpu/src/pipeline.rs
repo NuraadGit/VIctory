@@ -323,7 +323,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
@@ -551,6 +554,41 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// [`host_pipeline`], waiting until the pipeline is made (see
+/// [`make::made`]); later [`host_pipeline`] calls then find it at once.
+#[cfg(all(test, windows))]
+pub(crate) fn test_host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+    make::made(&pipeline(this).host)
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_compute_pipeline(
+    host: victory_shader::emit::HostShader,
+    used: Vec<victory_shader::UsedResource>,
+) -> This {
+    let hash = blake3::hash(&host.dxil).to_hex()[..16].to_owned();
+    let translated = OnceLock::new();
+    let _ = translated.set(Some(Translated { host, used }));
+    let shader = Arc::new(Shader {
+        stage: "compute",
+        hash,
+        container: Vec::new(),
+        translated,
+        #[cfg(feature = "diagnostics")]
+        wave64: OnceLock::new(),
+    });
+    let mut out = std::ptr::null();
+    assert_eq!(
+        hand_out(vec![shader], None, &PIPELINE_IIDS[0], &mut out),
+        crate::object::S_OK
+    );
+    assert!(
+        test_host_pipeline(out).is_some(),
+        "the host refused the test's pipeline"
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -684,3 +722,5 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod depth_bounds_test;
+#[cfg(all(test, windows))]
+mod rect_indirect_test;
